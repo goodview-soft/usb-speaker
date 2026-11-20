@@ -6,12 +6,13 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 4  # versionCode de l'APK
-const APP_VERSION := "1.3.0"
+const VERSION := 5  # versionCode de l'APK
+const APP_VERSION := "1.4.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
 const T_HELLO := 3  # téléphone -> PC : u32 fréquence du micro (= connexion acceptée)
+const T_CTRL := 5  # téléphone -> PC : [son du PC voulu, micro envoyé]
 const T_NAME := 4  # PC -> téléphone : nom du PC (utf8)
 const SINK := "usbspk_out"
 const MIC_SINK := "usbspk_mic_sink"
@@ -62,6 +63,10 @@ var pend_box: VBoxContainer
 var pend_sig := ""
 var last_pc := ""
 var name_sent := false
+var sound_check: CheckButton
+var phone_sound := true
+var phone_mic := true
+var prev_src := ""
 var http: HTTPRequest
 var dl: HTTPRequest
 var upd_btn: Button
@@ -144,9 +149,15 @@ func _build_ui() -> void:
 		pend_box = VBoxContainer.new()
 		pend_box.add_theme_constant_override("separation", 10)
 		v.add_child(pend_box)
+		sound_check = CheckButton.new()
+		sound_check.text = "Jouer le son du PC ici"
+		sound_check.button_pressed = true
+		sound_check.toggled.connect(func(_on): _send_ctrl())
+		v.add_child(sound_check)
 		mic_check = CheckButton.new()
 		mic_check.text = "Envoyer mon micro au PC"
-		mic_check.button_pressed = true
+		mic_check.button_pressed = false
+		mic_check.toggled.connect(func(_on): _send_ctrl())
 		v.add_child(mic_check)
 	else:
 		out_check = CheckButton.new()
@@ -209,6 +220,10 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 		for i in range(0, pl.size() - 1, 16):
 			p = maxi(p, absi(pl.decode_s16(i)))
 		peak = maxf(peak, p / 32768.0)
+	elif not is_phone and t == T_CTRL and pl.size() >= 2:
+		phone_sound = pl[0] == 1
+		phone_mic = pl[1] == 1
+		_pc_route()
 	elif not is_phone and t == T_HELLO and pl.size() >= 4:
 		mic_rate = pl.decode_u32(0)
 		_pc_link()
@@ -278,7 +293,7 @@ func _phone_process() -> void:
 		linked = false
 		_set_status("En attente du PC", "Connexion perdue.\n" + _my_ips())
 		return
-	player.volume_db = linear_to_db(maxf(vol_slider.value, 0.0001))
+	player.volume_db = linear_to_db(maxf(vol_slider.value, 0.0001)) if sound_check.button_pressed else -80.0
 	var n := cap.get_frames_available()
 	while n >= CHUNK:
 		var fr := cap.get_buffer(CHUNK)
@@ -351,9 +366,14 @@ func _accept(p: Dictionary) -> void:
 	h.resize(4)
 	h.encode_u32(0, int(AudioServer.get_mix_rate()))
 	_send(T_HELLO, h)
+	_send_ctrl()
 	cap.clear_buffer()
 	linked = true
 	_set_status("Enceinte active ✔", "Connecté à « %s »." % last_pc)
+
+
+func _send_ctrl() -> void:
+	_send(T_CTRL, PackedByteArray([1 if sound_check.button_pressed else 0, 1 if mic_check.button_pressed else 0]))
 
 
 func _my_ips() -> String:
@@ -365,6 +385,8 @@ func _my_ips() -> String:
 
 
 func _phone_audio(pl: PackedByteArray) -> void:
+	if not sound_check.button_pressed:
+		return
 	var frames := pl.size() / 4
 	# on garde ≤ 120 ms de retard : le surplus est jeté
 	var queued := int(RATE * 0.25) - pb.get_frames_available()
@@ -545,6 +567,9 @@ func _pc_link() -> void:
 	if linked:
 		return
 	linked = true
+	phone_sound = true
+	phone_mic = false
+	prev_src = _pa(["get-default-source"])
 	prev_sink = _pa(["get-default-sink"])
 	var m1 := _pa(["load-module", "module-null-sink", "sink_name=" + SINK,
 			"sink_properties=device.description=Telephone-USB"])
@@ -573,7 +598,11 @@ func _pc_link() -> void:
 func _pc_route() -> void:
 	if not linked:
 		return
-	var target := SINK if out_check.button_pressed else prev_sink
+	var target := SINK if (out_check.button_pressed and phone_sound) else prev_sink
+	# un seul micro : celui du téléphone quand il envoie, sinon on rend le micro d'origine
+	var want_src := MIC_SRC if phone_mic else prev_src
+	if want_src != "":
+		_pa(["set-default-source", want_src])
 	if target == "":
 		return
 	_pa(["set-default-sink", target])
@@ -615,6 +644,8 @@ func _pc_pump_capture() -> void:
 
 
 func _pc_teardown() -> void:
+	if prev_src != "":
+		_pa(["set-default-source", prev_src])
 	if prev_sink != "":
 		_pa(["set-default-sink", prev_sink])
 		for line in _pa(["list", "short", "sink-inputs"]).split("\n"):
@@ -642,7 +673,7 @@ func _pc_teardown() -> void:
 ## Au démarrage : retire d'éventuels restes d'un lancement précédent interrompu.
 func _pc_cleanup_leftovers() -> void:
 	for line in _pa(["list", "short", "modules"]).split("\n"):
-		if "usbspk" in line:
+		if "usbspk" in line or "soundlink" in line:
 			_pa(["unload-module", line.split("\t")[0]])
 	if _pa(["get-default-sink"]) == SINK:
 		for line in _pa(["list", "short", "sinks"]).split("\n"):
