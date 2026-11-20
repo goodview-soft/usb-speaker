@@ -6,13 +6,14 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 6  # versionCode de l'APK
-const APP_VERSION := "1.4.1"
+const VERSION := 7  # versionCode de l'APK
+const APP_VERSION := "1.5.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
 const T_HELLO := 3  # téléphone -> PC : u32 fréquence du micro (= connexion acceptée)
 const T_CTRL := 5  # téléphone -> PC : [son du PC voulu, micro envoyé]
+const T_DRIVE := 6  # téléphone -> PC : s16 volant, u8 gaz, u8 frein, u8 boutons (A B X Y)
 const T_NAME := 4  # PC -> téléphone : nom du PC (utf8)
 const SINK := "usbspk_out"
 const MIC_SINK := "usbspk_mic_sink"
@@ -63,6 +64,27 @@ var pend_box: VBoxContainer
 var pend_sig := ""
 var last_pc := ""
 var name_sent := false
+var tabs: TabContainer
+var wheel: Wheel
+var drive_info: Label
+var gas_z: Panel
+var brake_z: Panel
+var btn_z: Array = []
+var range_slider: HSlider
+var invert_check: CheckButton
+var calib_btn: Button
+var touches := {}
+var ang_off := 0.0
+var cal_t := 0.0
+var steer_s := 0.0
+var drive_was := false
+var pad_pid := -1
+var pad_io: FileAccess
+var pad_err: FileAccess
+var pad_last := ""
+var drive_t := 0
+var drive_v := [0, 0, 0, 0]
+var drive_check: CheckButton
 var sound_check: CheckButton
 var phone_sound := true
 var phone_mic := true
@@ -101,6 +123,24 @@ func _exit_tree() -> void:
 
 # ------------------------------------------------------------------ UI
 
+class Wheel extends Control:
+	var steer := 0.0:
+		set(v):
+			steer = v
+			queue_redraw()
+
+	func _draw() -> void:
+		var c := size / 2.0
+		var r := minf(size.x, size.y) * 0.42
+		var a := steer * deg_to_rad(90.0)
+		draw_arc(c, r, 0.0, TAU, 64, Color("e8edf5"), 10.0)
+		draw_line(c, c + Vector2(cos(a), sin(a)) * r, Color("e8edf5"), 9.0)
+		draw_line(c, c + Vector2(cos(a + PI), sin(a + PI)) * r, Color("e8edf5"), 9.0)
+		draw_line(c, c + Vector2(cos(a + PI / 2.0), sin(a + PI / 2.0)) * r, Color("e8edf5"), 9.0)
+		draw_circle(c, 14.0, Color("e8edf5"))
+		draw_circle(c + Vector2(cos(a - PI / 2.0), sin(a - PI / 2.0)) * r, 9.0, Color("e5484d"))
+
+
 func _build_ui() -> void:
 	var bg := ColorRect.new()
 	bg.color = Color("0f1218")
@@ -130,45 +170,129 @@ func _build_ui() -> void:
 	upd_btn.custom_minimum_size = Vector2(0, 52)
 	upd_btn.pressed.connect(_do_update)
 	v.add_child(upd_btn)
+	if is_phone:
+		pend_box = VBoxContainer.new()
+		pend_box.add_theme_constant_override("separation", 10)
+		v.add_child(pend_box)
+	tabs = TabContainer.new()
+	tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	v.add_child(tabs)
+	var p1 := VBoxContainer.new()
+	p1.name = "Partage de son"
+	p1.add_theme_constant_override("separation", 16)
+	tabs.add_child(p1)
 	bar = ProgressBar.new()
 	bar.max_value = 1.0
 	bar.show_percentage = false
 	bar.custom_minimum_size = Vector2(0, 14)
-	v.add_child(bar)
+	p1.add_child(bar)
 	if is_phone:
 		var l := Label.new()
 		l.text = "Volume"
-		v.add_child(l)
+		p1.add_child(l)
 		vol_slider = HSlider.new()
 		vol_slider.min_value = 0.0
 		vol_slider.max_value = 1.5
 		vol_slider.step = 0.01
 		vol_slider.value = 1.0
 		vol_slider.custom_minimum_size = Vector2(0, 48)
-		v.add_child(vol_slider)
-		pend_box = VBoxContainer.new()
-		pend_box.add_theme_constant_override("separation", 10)
-		v.add_child(pend_box)
+		p1.add_child(vol_slider)
 		sound_check = CheckButton.new()
 		sound_check.text = "Jouer le son du PC ici"
 		sound_check.button_pressed = true
 		sound_check.toggled.connect(func(_on): _send_ctrl())
-		v.add_child(sound_check)
+		p1.add_child(sound_check)
 		mic_check = CheckButton.new()
 		mic_check.text = "Envoyer mon micro au PC"
 		mic_check.button_pressed = false
 		mic_check.toggled.connect(func(_on): _send_ctrl())
-		v.add_child(mic_check)
+		p1.add_child(mic_check)
 	else:
 		out_check = CheckButton.new()
 		out_check.text = "Sortie son du PC → téléphone"
 		out_check.button_pressed = true
 		out_check.toggled.connect(func(_on): _pc_route())
-		v.add_child(out_check)
+		p1.add_child(out_check)
 		mic_check = CheckButton.new()
 		mic_check.text = "Micro du téléphone → PC"
 		mic_check.button_pressed = true
-		v.add_child(mic_check)
+		p1.add_child(mic_check)
+	_build_drive_tab()
+
+
+func _zone(id: String, txt: String, col: Color, h: int) -> Panel:
+	var p := Panel.new()
+	p.name = id
+	p.custom_minimum_size = Vector2(0, h)
+	p.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	p.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = col
+	sb.set_corner_radius_all(16)
+	p.add_theme_stylebox_override("panel", sb)
+	var l := Label.new()
+	l.text = txt
+	l.set_anchors_preset(Control.PRESET_FULL_RECT)
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	l.add_theme_font_size_override("font_size", 26)
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	p.add_child(l)
+	return p
+
+
+func _build_drive_tab() -> void:
+	var p := VBoxContainer.new()
+	p.name = "Conduite"
+	p.add_theme_constant_override("separation", 12)
+	tabs.add_child(p)
+	wheel = Wheel.new()
+	wheel.custom_minimum_size = Vector2(0, 170)
+	wheel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	p.add_child(wheel)
+	drive_info = Label.new()
+	drive_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	drive_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	p.add_child(drive_info)
+	if is_phone:
+		drive_info.text = "Tiens le téléphone comme un volant."
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 12)
+		brake_z = _zone("brake", "FREIN", Color("c0392b"), 150)
+		gas_z = _zone("gas", "GAZ", Color("27ae60"), 150)
+		row.add_child(brake_z)
+		row.add_child(gas_z)
+		p.add_child(row)
+		var row2 := HBoxContainer.new()
+		row2.add_theme_constant_override("separation", 10)
+		for k in ["A", "B", "X", "Y"]:
+			var z := _zone(k, k, Color("3b4252"), 64)
+			btn_z.append(z)
+			row2.add_child(z)
+		p.add_child(row2)
+		calib_btn = Button.new()
+		calib_btn.text = "Recentrer le volant (3 s)"
+		calib_btn.custom_minimum_size = Vector2(0, 52)
+		calib_btn.pressed.connect(func(): cal_t = 3.0)
+		p.add_child(calib_btn)
+		var l := Label.new()
+		l.text = "Angle pour braquer à fond"
+		p.add_child(l)
+		range_slider = HSlider.new()
+		range_slider.min_value = 20.0
+		range_slider.max_value = 90.0
+		range_slider.value = 45.0
+		range_slider.custom_minimum_size = Vector2(0, 40)
+		p.add_child(range_slider)
+		invert_check = CheckButton.new()
+		invert_check.text = "Inverser le sens"
+		p.add_child(invert_check)
+	else:
+		drive_info.text = "Sur le téléphone, ouvre l'onglet Conduite. Dans le jeu, choisis la manette « USB Speaker Volant »."
+		drive_check = CheckButton.new()
+		drive_check.text = "Manette virtuelle active"
+		drive_check.button_pressed = true
+		p.add_child(drive_check)
 
 
 func _set_status(t: String, s := "") -> void:
@@ -220,6 +344,12 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 		for i in range(0, pl.size() - 1, 16):
 			p = maxi(p, absi(pl.decode_s16(i)))
 		peak = maxf(peak, p / 32768.0)
+	elif not is_phone and t == T_DRIVE and pl.size() >= 5:
+		drive_v = [pl.decode_s16(0), pl[2], pl[3], pl[4]]
+		drive_t = Time.get_ticks_msec()
+		wheel.steer = drive_v[0] / 32767.0
+		if drive_check.button_pressed:
+			_pad_start()
 	elif not is_phone and t == T_CTRL and pl.size() >= 2:
 		phone_sound = pl[0] == 1
 		phone_mic = pl[1] == 1
@@ -233,9 +363,11 @@ func _process(delta: float) -> void:
 	peak = move_toward(peak, 0.0, delta * 1.5)
 	bar.value = peak
 	if is_phone:
+		_drive_tick(delta)
 		_phone_process()
 	else:
 		_pc_process(delta)
+		_pad_tick()
 
 
 # ------------------------------------------------------------------ Téléphone
@@ -642,6 +774,7 @@ func _pc_pump_capture() -> void:
 
 
 func _pc_teardown() -> void:
+	_pad_stop()
 	if prev_src != "":
 		_pa(["set-default-source", prev_src])
 	if prev_sink != "":
@@ -779,3 +912,151 @@ func _on_zip(result: int, code: int, _h: PackedStringArray, _b: PackedByteArray)
 	_pc_shutdown()
 	OS.create_process(exe, ["--audio-driver", "PulseAudio"])
 	get_tree().quit()
+
+
+# ------------------------------------------------------------------ Conduite
+
+func _input(ev: InputEvent) -> void:
+	if not is_phone:
+		return
+	if ev is InputEventScreenTouch:
+		if ev.pressed:
+			touches[ev.index] = ev.position
+		else:
+			touches.erase(ev.index)
+	elif ev is InputEventScreenDrag:
+		touches[ev.index] = ev.position
+
+
+## Téléphone : angle du volant (gravité) + boutons tactiles -> trame T_DRIVE.
+func _drive_tick(delta: float) -> void:
+	if tabs.current_tab != 1:
+		if drive_was:
+			drive_was = false
+			_send(T_DRIVE, PackedByteArray([0, 0, 0, 0, 0]))
+		return
+	drive_was = true
+	var g := Input.get_gravity()
+	if g.length() < 0.1:
+		g = Input.get_accelerometer()
+	var ang := rad_to_deg(atan2(g.x, g.y))
+	if cal_t > 0.0:
+		cal_t -= delta
+		calib_btn.text = "Recentrage dans %d s…" % ceili(maxf(cal_t, 0.0))
+		if cal_t <= 0.0:
+			ang_off = ang
+			calib_btn.text = "Recentrer le volant (3 s)"
+	var d := wrapf(ang - ang_off, -180.0, 180.0)
+	var tgt := clampf(d / range_slider.value, -1.0, 1.0) * (-1.0 if invert_check.button_pressed else 1.0)
+	steer_s = lerpf(steer_s, tgt, clampf(delta * 25.0, 0.0, 1.0))
+	wheel.steer = steer_s
+	var pr := {}
+	for pos in touches.values():
+		for z in [gas_z, brake_z] + btn_z:
+			if z.get_global_rect().has_point(pos):
+				pr[z.name] = true
+	for z in [gas_z, brake_z] + btn_z:
+		z.modulate = Color(1.5, 1.5, 1.5) if pr.has(z.name) else Color.WHITE
+	var mask := 0
+	for i in 4:
+		if pr.has(["A", "B", "X", "Y"][i]):
+			mask |= 1 << i
+	var b := PackedByteArray()
+	b.resize(5)
+	b.encode_s16(0, int(steer_s * 32767.0))
+	b[2] = 255 if pr.has("gas") else 0
+	b[3] = 255 if pr.has("brake") else 0
+	b[4] = mask
+	_send(T_DRIVE, b)
+
+
+const PAD_PY := """import os, struct, fcntl, sys, time
+fd = os.open('/dev/uinput', os.O_WRONLY | os.O_NONBLOCK)
+def io(req, arg=0):
+    fcntl.ioctl(fd, req, arg)
+SET_EV, SET_KEY, SET_ABS = 0x40045564, 0x40045565, 0x40045567
+DEV_SETUP, ABS_SETUP, CREATE, DESTROY = 0x405c5503, 0x401c5504, 0x5501, 0x5502
+io(SET_EV, 1); io(SET_EV, 3)
+BTN = [0x130, 0x131, 0x133, 0x134]
+for c in BTN + [0x136, 0x137, 0x13a, 0x13b, 0x13c, 0x13d, 0x13e]:
+    io(SET_KEY, c)
+AX = [(0, -32768, 32767), (1, -32768, 32767), (3, -32768, 32767), (4, -32768, 32767), (2, 0, 255), (5, 0, 255), (16, -1, 1), (17, -1, 1)]
+for c, mn, mx in AX:
+    io(SET_ABS, c)
+io(DEV_SETUP, struct.pack('<HHHH80sI', 3, 0x045e, 0x028e, 0x0110, b'USB Speaker Volant', 0))
+for c, mn, mx in AX:
+    io(ABS_SETUP, struct.pack('<H2x6i', c, 0, mn, mx, 0, 0, 0))
+io(CREATE)
+def ev(t, c, v):
+    s = time.time()
+    os.write(fd, struct.pack('llHHi', int(s), int((s % 1) * 1e6), t, c, v))
+state = {}
+try:
+    for line in sys.stdin:
+        try:
+            s, g, b, k = [int(x) for x in line.split()]
+        except Exception:
+            continue
+        for code, v in ((0, max(-32767, min(32767, s))), (5, g), (2, b)):
+            if state.get(code) != v:
+                state[code] = v
+                ev(3, code, v)
+        for i, code in enumerate(BTN):
+            on = (k >> i) & 1
+            if state.get(code) != on:
+                state[code] = on
+                ev(1, code, on)
+        ev(0, 0, 0)
+finally:
+    try:
+        io(DESTROY)
+    except Exception:
+        pass
+"""
+
+
+func _pad_start() -> void:
+	if pad_pid > 0 and OS.is_process_running(pad_pid):
+		return
+	var path := OS.get_user_data_dir() + "/usbspk_pad.py"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_string(PAD_PY)
+	f.close()
+	var io := OS.execute_with_pipe("python3", ["-I", path], false)
+	if not io.has("pid"):
+		drive_info.text = "python3 introuvable : manette virtuelle impossible."
+		return
+	pad_pid = io["pid"]
+	pad_io = io["stdio"]
+	pad_err = io["stderr"]
+	pad_last = ""
+	drive_info.text = "Manette virtuelle « USB Speaker Volant » active. Dans le jeu, choisis-la comme manette."
+
+
+func _pad_tick() -> void:
+	if pad_pid <= 0:
+		return
+	if not OS.is_process_running(pad_pid):
+		var msg := pad_err.get_as_text().strip_edges() if pad_err != null else ""
+		drive_info.text = "Manette virtuelle impossible (accès à /dev/uinput ?)\n" + msg.get_slice("\n", msg.get_slice_count("\n") - 1)
+		pad_pid = -1
+		pad_io = null
+		return
+	var v: Array = drive_v
+	if Time.get_ticks_msec() - drive_t > 1000:
+		v = [0, 0, 0, 0]
+		wheel.steer = 0.0
+	var line := "%d %d %d %d" % v
+	if line != pad_last:
+		pad_last = line
+		pad_io.store_line(line)
+		pad_io.flush()
+
+
+func _pad_stop() -> void:
+	if pad_pid > 0:
+		OS.kill(pad_pid)
+	pad_pid = -1
+	pad_io = null
