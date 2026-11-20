@@ -6,7 +6,9 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 2
+const VERSION := 3  # versionCode de l'APK
+const APP_VERSION := "1.2.0"
+const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
 const T_HELLO := 3  # téléphone -> PC : u32 fréquence du micro
@@ -54,6 +56,12 @@ var modules: PackedStringArray = []
 var try_t := 0.0
 var wait_t := 0.0
 var cand_i := 0
+var http: HTTPRequest
+var dl: HTTPRequest
+var upd_btn: Button
+var url_apk := ""
+var url_zip := ""
+var new_tag := ""
 var lan := PacketPeerUDP.new()
 var lan_ip := ""
 var lan_t := 0
@@ -63,6 +71,7 @@ var beacon_t := 0
 
 func _ready() -> void:
 	_build_ui()
+	_check_update()
 	if is_phone:
 		_phone_init()
 	else:
@@ -105,6 +114,11 @@ func _build_ui() -> void:
 	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	v.add_child(sub)
+	upd_btn = Button.new()
+	upd_btn.visible = false
+	upd_btn.custom_minimum_size = Vector2(0, 52)
+	upd_btn.pressed.connect(_do_update)
+	v.add_child(upd_btn)
 	bar = ProgressBar.new()
 	bar.max_value = 1.0
 	bar.show_percentage = false
@@ -567,3 +581,91 @@ func _pc_shutdown() -> void:
 	if th_adb != null:
 		th_adb.wait_to_finish()
 		th_adb = null
+
+
+# ------------------------------------------------------------------ Mise à jour (GitHub releases)
+
+func _check_update() -> void:
+	http = HTTPRequest.new()
+	add_child(http)
+	http.request_completed.connect(_on_release)
+	http.request("https://api.github.com/repos/%s/releases/latest" % REPO, ["User-Agent: usb-speaker"])
+
+
+func _newer(a: String, b: String) -> bool:
+	var x := a.split(".")
+	var y := b.split(".")
+	for i in 3:
+		var p := x[i].to_int() if i < x.size() else 0
+		var q := y[i].to_int() if i < y.size() else 0
+		if p != q:
+			return p > q
+	return false
+
+
+func _on_release(result: int, code: int, _h: PackedStringArray, body: PackedByteArray) -> void:
+	if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+		return
+	var d = JSON.parse_string(body.get_string_from_utf8())
+	if typeof(d) != TYPE_DICTIONARY:
+		return
+	new_tag = str(d.get("tag_name", "")).trim_prefix("v")
+	if new_tag == "" or not _newer(new_tag, APP_VERSION):
+		return
+	for a in d.get("assets", []):
+		if a["name"] == "usb-speaker.apk":
+			url_apk = a["browser_download_url"]
+		elif a["name"] == "UsbSpeaker-linux.zip":
+			url_zip = a["browser_download_url"]
+	if is_phone and url_apk != "":
+		upd_btn.text = "Mise à jour %s disponible : télécharger" % new_tag
+		upd_btn.visible = true
+	elif not is_phone and url_zip != "" and OS.get_executable_path().ends_with(".x86_64"):
+		upd_btn.text = "Mettre à jour vers %s" % new_tag
+		upd_btn.visible = true
+
+
+func _do_update() -> void:
+	if is_phone:
+		OS.shell_open(url_apk)  # le navigateur télécharge l'APK, puis « Installer »
+		return
+	upd_btn.disabled = true
+	upd_btn.text = "Téléchargement…"
+	dl = HTTPRequest.new()
+	dl.download_file = OS.get_user_data_dir() + "/upd.zip"
+	dl.request_completed.connect(_on_zip)
+	add_child(dl)
+	dl.request(url_zip)
+
+
+func _on_zip(result: int, code: int, _h: PackedStringArray, _b: PackedByteArray) -> void:
+	var zp := OS.get_user_data_dir() + "/upd.zip"
+	var rd := ZIPReader.new()
+	if result != HTTPRequest.RESULT_SUCCESS or code != 200 or rd.open(zp) != OK:
+		upd_btn.text = "Échec du téléchargement"
+		upd_btn.disabled = false
+		return
+	var dir := OS.get_executable_path().get_base_dir()
+	var exe := OS.get_executable_path()
+	var ok := true
+	for pair in [["UsbSpeaker/UsbSpeaker.x86_64", exe], ["UsbSpeaker/usb-speaker.apk", dir + "/usb-speaker.apk"]]:
+		if not rd.file_exists(pair[0]):
+			continue
+		var tmp: String = pair[1] + ".new"
+		var f := FileAccess.open(tmp, FileAccess.WRITE)
+		if f == null:
+			ok = false
+			break
+		f.store_buffer(rd.read_file(pair[0]))
+		f.close()
+		FileAccess.set_unix_permissions(tmp, 493 if pair[1] == exe else 420)
+		ok = ok and DirAccess.rename_absolute(tmp, pair[1]) == OK
+	rd.close()
+	DirAccess.remove_absolute(zp)
+	if not ok:
+		upd_btn.text = "Échec (dossier non modifiable ?)"
+		upd_btn.disabled = false
+		return
+	_pc_shutdown()
+	OS.create_process(exe, ["--audio-driver", "PulseAudio"])
+	get_tree().quit()
