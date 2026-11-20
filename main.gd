@@ -6,8 +6,8 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 11  # versionCode de l'APK
-const APP_VERSION := "1.8.1"
+const VERSION := 12  # versionCode de l'APK
+const APP_VERSION := "1.9.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
@@ -16,6 +16,8 @@ const T_CTRL := 5  # téléphone -> PC : [son du PC voulu, micro envoyé]
 const T_DRIVE := 6  # téléphone -> PC : 4×s16 sticks (LX LY RX RY), u8 LT, u8 RT, u16 boutons
 const BEACON_PORT := PORT + 4  # annonce des PC hôtes (UDP)
 const HOST_PORT := PORT + 5  # connexion téléphone -> PC hôte (TCP)
+const T_SHOT := 9  # PC -> téléphone : capture JPEG [flags: 1=début 2=fin] + données
+const T_SHOTREQ := 10  # téléphone -> PC : [x%, y%, largeur%, hauteur%]
 const T_PING := 7  # aller-retour (latence) : u32 ms
 const T_PONG := 8
 const T_NAME := 4  # PC -> téléphone : nom du PC (utf8)
@@ -120,6 +122,16 @@ var host_box: VBoxContainer
 var host_sig := ""
 var out_peer: StreamPeerTCP
 var out_t := 0
+var shot_frame: Panel
+var shot_view: TextureRect
+var shot_prev: TextureRect
+var shot_buf := PackedByteArray()
+var shot_until := 0
+var shot_req_t := 0
+var shot_last_t := 0
+var shot_sl: Array = []
+var shot_info: Label
+var sel_prev := false
 var drive_check: CheckButton
 var sound_check: CheckButton
 var phone_sound := true
@@ -280,7 +292,7 @@ func _build_ui() -> void:
 		mic_check.text = "Micro du téléphone → PC"
 		mic_check.button_pressed = true
 		p1.add_child(mic_check)
-	_build_drive_tab()
+	_build_game_tab()
 	_build_net_tab()
 
 
@@ -327,11 +339,64 @@ func _pbtn(txt: String, cx: float, w: float) -> Button:
 	return b
 
 
-func _build_drive_tab() -> void:
+func _build_game_tab() -> void:
+	var jeu := TabContainer.new()
+	jeu.name = "Jeu"
+	tabs.add_child(jeu)
+	var arma := TabContainer.new()
+	arma.name = "Arma Reforger"
+	jeu.add_child(arma)
+	_build_drive_tab(arma)
+	_build_screen_tab(arma)
+	if is_phone:
+		arma.tab_changed.connect(func(i): if i == 0: _open_pad(true))
+
+
+func _build_screen_tab(parent: Node) -> void:
+	var p := VBoxContainer.new()
+	p.name = "Écran"
+	p.add_theme_constant_override("separation", 10)
+	parent.add_child(p)
+	var info := Label.new()
+	info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	info.modulate = Color(1, 1, 1, 0.7)
+	p.add_child(info)
+	shot_prev = TextureRect.new()
+	shot_prev.custom_minimum_size = Vector2(0, 150)
+	shot_prev.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	shot_prev.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	if is_phone:
+		info.text = "Quand tu appuies sur « Regarder » (bouton Sel de la manette), le PC capture cette zone de son écran (par défaut en haut à gauche, le chat) et elle s'affiche dans un cadre."
+		for d in [["Position X (%)", 0, 90, 0], ["Position Y (%)", 0, 90, 0], ["Largeur (%)", 10, 100, 45],
+				["Hauteur (%)", 5, 100, 30], ["Affichage (secondes)", 2, 20, 6]]:
+			var l := Label.new()
+			l.text = d[0]
+			p.add_child(l)
+			var sl := HSlider.new()
+			sl.min_value = d[1]
+			sl.max_value = d[2]
+			sl.value = d[3]
+			sl.step = 1
+			sl.custom_minimum_size = Vector2(0, 34)
+			p.add_child(sl)
+			shot_sl.append(sl)
+		var tb := Button.new()
+		tb.text = "Tester la capture"
+		tb.custom_minimum_size = Vector2(0, 52)
+		tb.pressed.connect(func(): _request_shot(true))
+		p.add_child(tb)
+	else:
+		info.text = "Le téléphone demande des captures de l'écran de ce PC (zone choisie sur le téléphone)."
+		shot_info = Label.new()
+		p.add_child(shot_info)
+	p.add_child(shot_prev)
+
+
+func _build_drive_tab(parent: Node) -> void:
 	var p := VBoxContainer.new()
 	p.name = "Manette"
 	p.add_theme_constant_override("separation", 14)
-	tabs.add_child(p)
+	parent.add_child(p)
 	drive_info = Label.new()
 	drive_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	drive_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -343,7 +408,6 @@ func _build_drive_tab() -> void:
 		ob.custom_minimum_size = Vector2(0, 64)
 		ob.pressed.connect(func(): _open_pad(true))
 		p.add_child(ob)
-		tabs.tab_changed.connect(func(i): if i == 1: _open_pad(true))
 		_build_pad_ui()
 	else:
 		wheel = Wheel.new()
@@ -513,13 +577,36 @@ func _build_pad_ui() -> void:
 	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	pad_ui.add_child(bg)
 	add_child(pad_ui)
+	shot_frame = Panel.new()
+	shot_frame.anchor_left = 0.2
+	shot_frame.anchor_right = 0.8
+	shot_frame.anchor_top = 0.1
+	shot_frame.anchor_bottom = 0.52
+	shot_frame.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	shot_frame.visible = false
+	var fsb := StyleBoxFlat.new()
+	fsb.bg_color = Color(0, 0, 0, 0.85)
+	fsb.border_color = Color("e8edf5")
+	fsb.set_border_width_all(3)
+	fsb.set_corner_radius_all(10)
+	shot_frame.add_theme_stylebox_override("panel", fsb)
+	shot_view = TextureRect.new()
+	shot_view.set_anchors_preset(Control.PRESET_FULL_RECT)
+	shot_view.offset_left = 6
+	shot_view.offset_top = 6
+	shot_view.offset_right = -6
+	shot_view.offset_bottom = -6
+	shot_view.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	shot_view.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	shot_view.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	shot_frame.add_child(shot_view)
 	var g := Color("3b4252")
 	_pz("LT", "LT", g, 0.12, 0.26, 150, 64)
 	_pz("LB", "LB", g, 0.12, 0.40, 150, 54)
 	_pz("RT", "RT", g, 0.88, 0.26, 150, 64)
 	_pz("RB", "RB", g, 0.88, 0.40, 150, 54)
-	_pz("Select", "Sel", g, 0.43, 0.42, 80, 44, 18)
-	_pz("Start", "Start", g, 0.57, 0.42, 80, 44, 18)
+	_pz("Select", "Regarder", g, 0.43, 0.42, 110, 44, 16)
+	_pz("Start", "Menu", g, 0.57, 0.42, 80, 44, 16)
 	_pz("DUp", "▲", g, 0.37, 0.60, 62, 62)
 	_pz("DDown", "▼", g, 0.37, 0.88, 62, 62)
 	_pz("DLeft", "◀", g, 0.30, 0.74, 62, 62)
@@ -555,6 +642,7 @@ func _build_pad_ui() -> void:
 	rc.pressed.connect(func(): cal_t = 2.0)
 	inv_btn = _pbtn("Inverser", 0.72, 120)
 	inv_btn.toggle_mode = true
+	pad_ui.add_child(shot_frame)
 	pad_hint = Label.new()
 	pad_hint.anchor_left = 0.3
 	pad_hint.anchor_right = 0.7
@@ -617,6 +705,21 @@ func _read() -> bool:
 
 
 func _on_frame(t: int, pl: PackedByteArray) -> void:
+	if t == T_SHOT and is_phone and pl.size() >= 2:
+		if pl[0] & 1:
+			shot_buf = PackedByteArray()
+		shot_buf.append_array(pl.slice(1))
+		if pl[0] & 2:
+			var im := Image.new()
+			if im.load_jpg_from_buffer(shot_buf) == OK:
+				var tx := ImageTexture.create_from_image(im)
+				shot_view.texture = tx
+				shot_prev.texture = tx
+				shot_until = Time.get_ticks_msec() + int(shot_sl[4].value) * 1000
+		return
+	if t == T_SHOTREQ and not is_phone and pl.size() >= 4:
+		_pc_shot(pl)
+		return
 	if t == T_PING:
 		_send(T_PONG, pl)
 		return
@@ -1320,6 +1423,11 @@ func _drive_tick(delta: float) -> void:
 				pr[z.name] = true
 	for z in pad_zones:
 		z.modulate = Color(1.6, 1.6, 1.6) if pr.has(z.name) else Color.WHITE
+	var sel := pr.has("Select")
+	if sel and (not sel_prev or Time.get_ticks_msec() - shot_req_t > 1200):
+		_request_shot(false)
+	sel_prev = sel
+	shot_frame.visible = Time.get_ticks_msec() < shot_until
 	var lx := lstick.v.x
 	if gyro_on or cal_t > 0.0:
 		var g := Input.get_gravity()
@@ -1354,6 +1462,15 @@ func _drive_tick(delta: float) -> void:
 	b[9] = 255 if pr.has("RT") else 0
 	b.encode_u16(10, mask)
 	_send_pad(b)
+
+
+func _request_shot(show_prev: bool) -> void:
+	shot_req_t = Time.get_ticks_msec()
+	var b := PackedByteArray()
+	for sl in shot_sl:
+		b.append(int(sl.value))
+	b.resize(4)
+	_send(T_SHOTREQ, b)
 
 
 ## Manette : UDP (seul le dernier état compte, pas de retard cumulé) ; TCP si tunnel adb.
@@ -1427,6 +1544,55 @@ finally:
     except Exception:
         pass
 """
+
+
+## PC : capture une zone de l'écran principal (fractions en %) et l'envoie en JPEG.
+func _grab(fx: float, fy: float, fw: float, fh: float) -> Image:
+	var scr := DisplayServer.get_primary_screen()
+	var img := DisplayServer.screen_get_image(scr)
+	var sz := DisplayServer.screen_get_size(scr)
+	if img != null and not img.is_empty():
+		sz = img.get_size()
+	var r := Rect2i(int(fx * sz.x), int(fy * sz.y), maxi(16, int(fw * sz.x)), maxi(16, int(fh * sz.y)))
+	r = r.intersection(Rect2i(Vector2i.ZERO, sz))
+	if r.size.x < 1 or r.size.y < 1:
+		return null
+	if img != null and not img.is_empty():
+		return img.get_region(r)
+	# repli : ffmpeg (X11)
+	var path := OS.get_user_data_dir() + "/usbspk_shot.png"
+	var disp := OS.get_environment("DISPLAY")
+	OS.execute("ffmpeg", ["-v", "quiet", "-y", "-f", "x11grab", "-video_size", "%dx%d" % [r.size.x, r.size.y],
+			"-i", "%s+%d,%d" % [disp if disp != "" else ":0.0", r.position.x, r.position.y], "-frames:v", "1", path])
+	var im := Image.new()
+	return im if im.load(path) == OK else null
+
+
+func _pc_shot(pl: PackedByteArray) -> void:
+	var now := Time.get_ticks_msec()
+	if now - shot_last_t < 300:
+		return
+	shot_last_t = now
+	var im := _grab(pl[0] / 100.0, pl[1] / 100.0, pl[2] / 100.0, pl[3] / 100.0)
+	if im == null:
+		if shot_info != null:
+			shot_info.text = "Capture impossible."
+		return
+	if im.get_width() > 800:
+		im.resize(800, int(im.get_height() * 800.0 / im.get_width()), Image.INTERPOLATE_BILINEAR)
+	im.convert(Image.FORMAT_RGB8)
+	var jpg := im.save_jpg_to_buffer(0.7)
+	shot_prev.texture = ImageTexture.create_from_image(im)
+	if shot_info != null:
+		shot_info.text = "Dernière capture : %dx%d, %d Ko" % [im.get_width(), im.get_height(), jpg.size() / 1024]
+	var pos := 0
+	while pos < jpg.size():
+		var n := mini(40000, jpg.size() - pos)
+		var flags := (1 if pos == 0 else 0) | (2 if pos + n >= jpg.size() else 0)
+		var c := PackedByteArray([flags])
+		c.append_array(jpg.slice(pos, pos + n))
+		_send(T_SHOT, c)
+		pos += n
 
 
 func _apply_drive(pl: PackedByteArray) -> void:
