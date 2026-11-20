@@ -6,8 +6,8 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 19  # versionCode de l'APK
-const APP_VERSION := "2.3.0"
+const VERSION := 21  # versionCode de l'APK
+const APP_VERSION := "2.5.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
@@ -148,6 +148,23 @@ var chat_panel: Panel
 var chat_line: LineEdit
 var kb_pid := -1
 var kb_io: FileAccess
+var f_text: Font
+var f_caps: Font
+var f_mono: Font
+var led: Control
+var menu_ui: Control
+var menu_margin: MarginContainer
+var menu_btn: Button
+var chat_hist: Array = []
+var hist_batch := 0
+var list_scroll: ScrollContainer
+var undo_btn: Button
+var clear_btn: Button
+var clear_armed := 0
+var cam_held := false
+var cam_last := 0
+var cap_int_sl: HSlider
+var shot_busy := false
 var chat_scroll: ScrollContainer
 var chat_zoom := 1.0
 var zoom_lbl: Label
@@ -213,6 +230,7 @@ func _ready() -> void:
 	if not is_phone:
 		win.size = Vector2i(460, 720)
 		win.min_size = Vector2i(380, 560)
+	_load_fonts()
 	theme = _make_theme()
 	_build_ui()
 	get_viewport().size_changed.connect(_fit)
@@ -222,6 +240,21 @@ func _ready() -> void:
 		_phone_init()
 	else:
 		_pc_init()
+	if is_phone and OS.get_environment("USBSPK_HISTTEST") == "1":
+		chat_hist = []
+		hist_batch = 1
+		_hist_merge([{"n": "Jean", "m": "salut tout le monde, quelqu'un a un helico ?"}, {"n": "Vasco", "m": "j'ai besoin de munitions 5.56 svp"}])
+		hist_batch = 2
+		_hist_merge([{"n": "Jean", "m": "salut tout le monde quelqu'un a un hélico ?"}, {"n": "Vasco", "m": "j'ai besoin de munitions 5.56 svp"},
+				{"n": "Mike", "m": "ok je viens avec le camion", "t": "ok I am coming with the truck"}])
+		print("HIST fusion (attendu 3): ", chat_hist.size())
+		_hist_merge([{"n": "Mike", "m": "ok je viens avec le camion", "t": "autre"}])
+		print("HIST rejeu (attendu 3): ", chat_hist.size())
+		_hist_undo()
+		print("HIST apres annulation (attendu 2): ", chat_hist.size())
+		chat_hist = []
+		_hist_save()
+		get_tree().quit()
 	if is_phone and OS.get_environment("USBSPK_PADTEST") == "1":
 		_open_pad(true)
 		gyro_btn.button_pressed = true
@@ -236,6 +269,7 @@ func _notification(what: int) -> void:
 		owned.clear()
 		lstick.release()
 		rstick.release()
+		_cam_up()
 
 
 func _exit_tree() -> void:
@@ -245,14 +279,24 @@ func _exit_tree() -> void:
 
 # ------------------------------------------------------------------ UI
 
-const C_BG := Color("0f1218")
-const C_BG2 := Color("1a2030")
-const C_BG3 := Color("283147")
-const C_ACC := Color("4f8cff")
-const C_TXT := Color("e8edf5")
+const C_BG := Color("0b0e0d")
+const C_PANEL := Color("131916")
+const C_PANEL2 := Color("1a221e")
+const C_LINE := Color("2c372f")
+const C_ACC := Color("e3a32b")
+const C_TXT := Color("d9ddd3")
+const C_DIM := Color("8a948b")
+const C_OK := Color("6fbf73")
+const C_BAD := Color("d0493f")
+const C_BG2 := C_PANEL
+const C_BG3 := C_LINE
 
 
-func _sbox(col: Color, radius := 12, ph := 12, pv := 8, border := Color(0, 0, 0, 0), bw := 0) -> StyleBoxFlat:
+func _flat(bg: Color, border := Color(0, 0, 0, 0), bw := 0, ph := 12, pv := 8) -> StyleBoxFlat:
+	return _sbox(bg, 0, ph, pv, border, bw)
+
+
+func _sbox(col: Color, radius := 0, ph := 12, pv := 8, border := Color(0, 0, 0, 0), bw := 0) -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = col
 	sb.set_corner_radius_all(radius)
@@ -267,98 +311,161 @@ func _sbox(col: Color, radius := 12, ph := 12, pv := 8, border := Color(0, 0, 0,
 
 
 func _switch_tex(on: bool) -> ImageTexture:
-	var im := Image.create(48, 28, false, Image.FORMAT_RGBA8)
-	var track := C_ACC if on else Color("3b4252")
-	var kx := 34.0 if on else 14.0
-	for y in 28:
-		for x in 48:
-			var px := Vector2(x + 0.5, y + 0.5)
-			var d := px.distance_to(Vector2(clampf(px.x, 14.0, 34.0), 14.0)) - 14.0
-			var kd := px.distance_to(Vector2(kx, 14.0)) - 10.0
-			var c := track.lerp(Color.WHITE, clampf(0.5 - kd, 0.0, 1.0))
-			c.a = clampf(0.5 - d, 0.0, 1.0)
+	var im := Image.create(44, 22, false, Image.FORMAT_RGBA8)
+	var line := C_ACC if on else C_LINE
+	var fill := Color(C_ACC, 0.22) if on else Color(0, 0, 0, 0)
+	var kx := 27 if on else 3
+	var kc := C_ACC if on else C_DIM
+	for y in 22:
+		for x in 44:
+			var c := fill
+			if x == 0 or y == 0 or x == 43 or y == 21:
+				c = line
+			elif x >= kx and x < kx + 14 and y >= 4 and y < 18:
+				c = kc
 			im.set_pixel(x, y, c)
 	return ImageTexture.create_from_image(im)
 
 
-func _cam_tex() -> ImageTexture:
+func _sd_box(p: Vector2, c: Vector2, h: Vector2) -> float:
+	var q := (p - c).abs() - h
+	return Vector2(maxf(q.x, 0.0), maxf(q.y, 0.0)).length() + minf(maxf(q.x, q.y), 0.0)
+
+
+func _stroke(d: float, w := 2.0) -> float:
+	return clampf(0.5 - (absf(d) - w * 0.5), 0.0, 1.0)
+
+
+func _icon(kind: String) -> ImageTexture:
 	var im := Image.create(40, 40, false, Image.FORMAT_RGBA8)
 	for y in 40:
 		for x in 40:
 			var p := Vector2(x + 0.5, y + 0.5)
-			# corps arrondi (4,13)-(36,34), bosse (14,8)-(26,13), objectif percé
-			var q := (p - Vector2(20, 23.5)).abs() - Vector2(16, 10.5) + Vector2(5, 5)
-			var body := (Vector2(maxf(q.x, 0.0), maxf(q.y, 0.0)).length() + minf(maxf(q.x, q.y), 0.0)) - 5.0
-			var bump := maxf(absf(p.x - 20.0) - 6.0, absf(p.y - 10.5) - 2.5)
-			var d := minf(body, bump)
-			var a := clampf(0.5 - d, 0.0, 1.0)
-			var lens := p.distance_to(Vector2(20, 24))
-			a *= 1.0 - clampf(0.5 - (absf(lens - 6.0) - 2.0), 0.0, 1.0) * 0.0
-			if lens < 8.0 and lens > 5.0:
-				a = 0.0
+			var a := 0.0
+			match kind:
+				"cam":
+					a = maxf(_stroke(_sd_box(p, Vector2(20, 24), Vector2(15, 10))), _stroke(_sd_box(p, Vector2(20, 12.5), Vector2(6, 2.5))))
+					a = maxf(a, _stroke(p.distance_to(Vector2(20, 24)) - 6.0))
+					a = maxf(a, clampf(1.5 - p.distance_to(Vector2(20, 24)) + 0.5, 0.0, 1.0))
+				"mic":
+					a = _stroke(p.distance_to(Vector2(20, clampf(p.y, 12.0, 18.0))) - 6.0)
+					if p.y >= 18.0:
+						a = maxf(a, _stroke(p.distance_to(Vector2(20, 18)) - 11.0))
+					a = maxf(a, clampf(0.5 - _sd_box(p, Vector2(20, 31.5), Vector2(1.0, 3.5)), 0.0, 1.0))
+					a = maxf(a, clampf(0.5 - _sd_box(p, Vector2(20, 35.5), Vector2(6.0, 1.0)), 0.0, 1.0))
+				"menu":
+					for yy in [12.0, 20.0, 28.0]:
+						a = maxf(a, clampf(0.5 - _sd_box(p, Vector2(20, yy), Vector2(12, 1.2)), 0.0, 1.0))
 			im.set_pixel(x, y, Color(1, 1, 1, a))
 	return ImageTexture.create_from_image(im)
 
 
+func _cam_tex() -> ImageTexture:
+	return _icon("cam")
+
+
 func _mic_tex() -> ImageTexture:
-	var im := Image.create(40, 40, false, Image.FORMAT_RGBA8)
-	for y in 40:
-		for x in 40:
-			var p := Vector2(x + 0.5, y + 0.5)
-			var cap_d := p.distance_to(Vector2(20.0, clampf(p.y, 12.0, 18.0))) - 6.0
-			var arc := 1e9
-			if p.y >= 18.0:
-				arc = absf(p.distance_to(Vector2(20.0, 18.0)) - 11.0) - 1.4
-			var stem := maxf(absf(p.x - 20.0) - 1.4, absf(p.y - 32.5) - 3.5)
-			var base := maxf(absf(p.x - 20.0) - 6.0, absf(p.y - 36.0) - 1.4)
-			var dd := minf(minf(cap_d, arc), minf(stem, base))
-			im.set_pixel(x, y, Color(1, 1, 1, clampf(0.5 - dd, 0.0, 1.0)))
-	return ImageTexture.create_from_image(im)
+	return _icon("mic")
 
 
 func _knob_tex(d: int, col: Color) -> ImageTexture:
 	var im := Image.create(d, d, false, Image.FORMAT_RGBA8)
-	var r := d / 2.0
-	for y in d:
-		for x in d:
-			var dist := Vector2(x + 0.5, y + 0.5).distance_to(Vector2(r, r))
-			var c := col.lerp(Color.WHITE, clampf(dist - (r - 4.0), 0.0, 1.0))
-			c.a = clampf(r - dist, 0.0, 1.0)
-			im.set_pixel(x, y, c)
+	im.fill(col)
 	return ImageTexture.create_from_image(im)
 
 
 ## Thème commun : gros éléments tactiles, coins arrondis, sombre.
+func _load_fonts() -> void:
+	var med: Font = load("res://fonts/BarlowCondensed-Medium.ttf")
+	var semi: Font = load("res://fonts/BarlowCondensed-SemiBold.ttf")
+	var mono: Font = load("res://fonts/ShareTechMono-Regular.ttf")
+	f_text = med if med != null else ThemeDB.fallback_font
+	var fv := FontVariation.new()
+	fv.base_font = semi if semi != null else f_text
+	fv.spacing_glyph = 1
+	f_caps = fv
+	f_mono = mono if mono != null else f_text
+
+
+func _variation(t: Theme, name: String, base: String) -> void:
+	t.set_type_variation(name, base)
+
+
+## Thème « tactique » : fond noir-vert, accent ambre, angles droits, texte condensé.
 func _make_theme() -> Theme:
 	var t := Theme.new()
-	t.default_font_size = 16
+	t.default_font = f_text
+	t.default_font_size = 18
 	t.set_color("font_color", "Label", C_TXT)
-	for st in ["normal", "hover", "pressed", "disabled"]:
-		var col := C_BG3
-		if st == "hover":
-			col = C_BG3.lightened(0.12)
-		elif st == "pressed":
-			col = C_ACC
-		elif st == "disabled":
-			col = C_BG2
-		t.set_stylebox(st, "Button", _sbox(col))
+	for v in [["Caps", f_caps, 12, C_DIM], ["Section", f_caps, 14, C_ACC], ["Mono", f_mono, 14, C_DIM], ["Name", f_mono, 14, C_ACC]]:
+		_variation(t, v[0], "Label")
+		t.set_font("font", v[0], v[1])
+		t.set_font_size("font_size", v[0], v[2])
+		t.set_color("font_color", v[0], v[3])
+	# boutons
+	t.set_font("font", "Button", f_caps)
+	t.set_font_size("font_size", "Button", 15)
+	t.set_stylebox("normal", "Button", _flat(C_PANEL, C_LINE, 1, 14, 9))
+	t.set_stylebox("hover", "Button", _flat(C_PANEL2, C_ACC, 1, 14, 9))
+	t.set_stylebox("pressed", "Button", _flat(C_PANEL2, C_ACC, 1, 14, 9))
+	t.set_stylebox("hover_pressed", "Button", _flat(C_PANEL2, C_ACC, 1, 14, 9))
+	t.set_stylebox("disabled", "Button", _flat(C_PANEL, C_LINE, 1, 14, 9))
 	t.set_stylebox("focus", "Button", StyleBoxEmpty.new())
 	t.set_color("font_color", "Button", C_TXT)
-	t.set_color("font_pressed_color", "Button", Color.WHITE)
 	t.set_color("font_hover_color", "Button", Color.WHITE)
-	t.set_color("font_disabled_color", "Button", Color(1, 1, 1, 0.4))
-	# onglets
-	t.set_font_size("font_size", "TabContainer", 14)
-	t.set_stylebox("tab_selected", "TabContainer", _sbox(C_ACC, 10, 10, 8))
-	t.set_stylebox("tab_unselected", "TabContainer", _sbox(C_BG2, 10, 10, 8))
-	t.set_stylebox("tab_hovered", "TabContainer", _sbox(C_BG3, 10, 10, 8))
-	t.set_stylebox("tab_disabled", "TabContainer", _sbox(C_BG2, 10, 10, 8))
-	t.set_stylebox("panel", "TabContainer", StyleBoxEmpty.new())
-	t.set_stylebox("tabbar_background", "TabContainer", StyleBoxEmpty.new())
-	t.set_color("font_selected_color", "TabContainer", Color.WHITE)
-	t.set_color("font_unselected_color", "TabContainer", Color(1, 1, 1, 0.65))
-	t.set_color("font_hovered_color", "TabContainer", Color.WHITE)
-	t.set_constant("side_margin", "TabContainer", 0)
+	t.set_color("font_pressed_color", "Button", C_ACC)
+	t.set_color("font_hover_pressed_color", "Button", C_ACC)
+	t.set_color("font_disabled_color", "Button", Color(C_TXT, 0.35))
+	t.set_color("icon_normal_color", "Button", C_TXT)
+	t.set_color("icon_hover_color", "Button", Color.WHITE)
+	t.set_color("icon_pressed_color", "Button", C_ACC)
+	t.set_constant("h_separation", "Button", 10)
+	# variantes
+	_variation(t, "BtnPrimary", "Button")
+	t.set_stylebox("normal", "BtnPrimary", _flat(C_ACC, C_ACC, 1, 18, 10))
+	t.set_stylebox("hover", "BtnPrimary", _flat(C_ACC.lightened(0.12), C_ACC, 1, 18, 10))
+	t.set_stylebox("pressed", "BtnPrimary", _flat(C_ACC.darkened(0.2), C_ACC, 1, 18, 10))
+	t.set_font_size("font_size", "BtnPrimary", 16)
+	for c in ["font_color", "font_hover_color", "font_pressed_color"]:
+		t.set_color(c, "BtnPrimary", Color("0f120f"))
+	_variation(t, "BtnAccent", "Button")
+	t.set_stylebox("normal", "BtnAccent", _flat(Color(C_ACC, 0.08), C_ACC, 1, 16, 12))
+	t.set_stylebox("hover", "BtnAccent", _flat(Color(C_ACC, 0.18), C_ACC, 1, 16, 12))
+	t.set_stylebox("pressed", "BtnAccent", _flat(Color(C_ACC, 0.28), C_ACC, 1, 16, 12))
+	t.set_font_size("font_size", "BtnAccent", 17)
+	for c in ["font_color", "font_hover_color", "font_pressed_color"]:
+		t.set_color(c, "BtnAccent", C_ACC)
+	for c in ["icon_normal_color", "icon_hover_color", "icon_pressed_color"]:
+		t.set_color(c, "BtnAccent", C_ACC)
+	_variation(t, "BtnChip", "Button")
+	t.set_stylebox("normal", "BtnChip", _flat(Color(0, 0, 0, 0), C_LINE, 1, 10, 5))
+	t.set_stylebox("hover", "BtnChip", _flat(Color(0, 0, 0, 0), C_ACC, 1, 10, 5))
+	t.set_stylebox("pressed", "BtnChip", _flat(Color(C_ACC, 0.16), C_ACC, 1, 10, 5))
+	t.set_stylebox("hover_pressed", "BtnChip", _flat(Color(C_ACC, 0.16), C_ACC, 1, 10, 5))
+	t.set_font_size("font_size", "BtnChip", 13)
+	_variation(t, "BtnIcon", "Button")
+	for st in ["normal", "disabled"]:
+		t.set_stylebox(st, "BtnIcon", _flat(C_PANEL, C_LINE, 1, 0, 0))
+	for st in ["hover", "pressed", "hover_pressed"]:
+		t.set_stylebox(st, "BtnIcon", _flat(C_PANEL2, C_ACC, 1, 0, 0))
+	# listes déroulantes
+	for st in ["normal", "disabled"]:
+		t.set_stylebox(st, "OptionButton", _flat(C_PANEL, C_LINE, 1, 12, 8))
+	for st in ["hover", "pressed", "hover_pressed"]:
+		t.set_stylebox(st, "OptionButton", _flat(C_PANEL2, C_ACC, 1, 12, 8))
+	t.set_stylebox("focus", "OptionButton", StyleBoxEmpty.new())
+	t.set_font("font", "OptionButton", f_caps)
+	t.set_font_size("font_size", "OptionButton", 14)
+	t.set_color("font_color", "OptionButton", C_TXT)
+	t.set_color("font_hover_color", "OptionButton", Color.WHITE)
+	t.set_color("font_pressed_color", "OptionButton", C_ACC)
+	t.set_stylebox("panel", "PopupMenu", _flat(C_PANEL, C_ACC, 1, 6, 6))
+	t.set_stylebox("hover", "PopupMenu", _flat(C_PANEL2, Color(0, 0, 0, 0), 0, 8, 6))
+	t.set_font("font", "PopupMenu", f_caps)
+	t.set_font_size("font_size", "PopupMenu", 15)
+	t.set_color("font_color", "PopupMenu", C_TXT)
+	t.set_color("font_hover_color", "PopupMenu", C_ACC)
+	t.set_constant("v_separation", "PopupMenu", 12)
 	# interrupteurs
 	var on_t := _switch_tex(true)
 	var off_t := _switch_tex(false)
@@ -366,33 +473,34 @@ func _make_theme() -> Theme:
 		t.set_icon(n, "CheckButton", on_t)
 	for n in ["unchecked", "unchecked_disabled", "unchecked_mirrored", "unchecked_disabled_mirrored"]:
 		t.set_icon(n, "CheckButton", off_t)
-	t.set_constant("h_separation", "CheckButton", 10)
+	t.set_constant("h_separation", "CheckButton", 12)
 	for st in ["normal", "hover", "pressed", "hover_pressed", "disabled", "focus"]:
-		t.set_stylebox(st, "CheckButton", _sbox(Color(0, 0, 0, 0), 8, 4, 6))
-	t.set_color("font_color", "CheckButton", C_TXT)
-	t.set_color("font_pressed_color", "CheckButton", C_TXT)
-	t.set_color("font_hover_color", "CheckButton", C_TXT)
-	t.set_color("font_hover_pressed_color", "CheckButton", C_TXT)
+		t.set_stylebox(st, "CheckButton", _flat(Color(0, 0, 0, 0), Color(0, 0, 0, 0), 0, 2, 6))
+	t.set_font_size("font_size", "CheckButton", 17)
+	for c in ["font_color", "font_pressed_color", "font_hover_color", "font_hover_pressed_color"]:
+		t.set_color(c, "CheckButton", C_TXT)
 	# curseurs
-	var knob := _knob_tex(30, C_ACC)
-	t.set_icon("grabber", "HSlider", knob)
-	t.set_icon("grabber_highlight", "HSlider", knob)
-	t.set_icon("grabber_disabled", "HSlider", knob)
-	t.set_stylebox("slider", "HSlider", _sbox(C_BG3, 4, 0, 3))
-	t.set_stylebox("grabber_area", "HSlider", _sbox(C_ACC, 4, 0, 3))
-	t.set_stylebox("grabber_area_highlight", "HSlider", _sbox(C_ACC, 4, 0, 3))
+	var knob := _knob_tex(16, C_ACC)
+	for n in ["grabber", "grabber_highlight", "grabber_disabled"]:
+		t.set_icon(n, "HSlider", knob)
+	t.set_stylebox("slider", "HSlider", _flat(C_LINE, Color(0, 0, 0, 0), 0, 0, 1))
+	t.set_stylebox("grabber_area", "HSlider", _flat(C_ACC, Color(0, 0, 0, 0), 0, 0, 1))
+	t.set_stylebox("grabber_area_highlight", "HSlider", _flat(C_ACC, Color(0, 0, 0, 0), 0, 0, 1))
 	# champ de texte
-	t.set_stylebox("normal", "LineEdit", _sbox(C_BG2, 10, 12, 8, C_BG3, 2))
-	t.set_stylebox("focus", "LineEdit", _sbox(C_BG2, 10, 12, 8, C_ACC, 2))
+	t.set_stylebox("normal", "LineEdit", _flat(Color("0e1311"), C_LINE, 1, 12, 10))
+	t.set_stylebox("focus", "LineEdit", _flat(Color("0e1311"), C_ACC, 1, 12, 10))
+	t.set_font_size("font_size", "LineEdit", 19)
 	t.set_color("font_color", "LineEdit", C_TXT)
-	t.set_color("font_placeholder_color", "LineEdit", Color(1, 1, 1, 0.4))
+	t.set_color("caret_color", "LineEdit", C_ACC)
+	t.set_color("font_placeholder_color", "LineEdit", Color(C_DIM, 0.7))
+	t.set_color("selection_color", "LineEdit", Color(C_ACC, 0.35))
 	# barre de niveau
-	t.set_stylebox("background", "ProgressBar", _sbox(C_BG3, 7, 0, 0))
-	t.set_stylebox("fill", "ProgressBar", _sbox(Color("2ecc71"), 7, 0, 0))
-	# menus déroulants
-	t.set_stylebox("panel", "PopupMenu", _sbox(C_BG2, 12, 10, 10, C_BG3, 2))
-	t.set_font_size("font_size", "PopupMenu", 16)
-	t.set_constant("v_separation", "PopupMenu", 10)
+	t.set_stylebox("background", "ProgressBar", _flat(C_LINE, Color(0, 0, 0, 0), 0, 0, 2))
+	t.set_stylebox("fill", "ProgressBar", _flat(C_OK, Color(0, 0, 0, 0), 0, 0, 2))
+	# barres de défilement fines
+	t.set_stylebox("scroll", "VScrollBar", _flat(Color(0, 0, 0, 0), Color(0, 0, 0, 0), 0, 2, 0))
+	for n in ["grabber", "grabber_highlight", "grabber_pressed"]:
+		t.set_stylebox(n, "VScrollBar", _flat(C_LINE, Color(0, 0, 0, 0), 0, 2, 0))
 	return t
 
 
@@ -419,10 +527,13 @@ func _fit() -> void:
 		var extra := (avail - 560.0) / 2.0
 		l += extra
 		r += extra
-	margin.add_theme_constant_override("margin_left", int(l))
-	margin.add_theme_constant_override("margin_right", int(r))
-	margin.add_theme_constant_override("margin_top", int(tp))
-	margin.add_theme_constant_override("margin_bottom", int(b))
+	for mc in [margin, menu_margin]:
+		if mc == null:
+			continue
+		mc.add_theme_constant_override("margin_left", int(l))
+		mc.add_theme_constant_override("margin_right", int(r))
+		mc.add_theme_constant_override("margin_top", int(tp))
+		mc.add_theme_constant_override("margin_bottom", int(b))
 	if pad_safe != null:
 		_fit_pad()
 
@@ -446,6 +557,44 @@ func _fit_pad() -> void:
 	pad_safe.offset_bottom = -b
 
 
+class Led extends Control:
+	var col := Color("8a948b"):
+		set(v):
+			col = v
+			queue_redraw()
+
+	func _draw() -> void:
+		draw_circle(size / 2.0, 4.0, col)
+		draw_arc(size / 2.0, 7.0, 0.0, TAU, 24, Color(col, 0.35), 1.0)
+
+
+class HudFrame extends Control:
+	func _draw() -> void:
+		var c := Color("e3a32b")
+		var l := 14.0
+		var w := 2.0
+		var s2 := size
+		for pt in [[Vector2.ZERO, Vector2(1, 1)], [Vector2(s2.x, 0), Vector2(-1, 1)],
+				[Vector2(0, s2.y), Vector2(1, -1)], [Vector2(s2.x, s2.y), Vector2(-1, -1)]]:
+			draw_line(pt[0], pt[0] + Vector2(l * pt[1].x, 0), c, w)
+			draw_line(pt[0], pt[0] + Vector2(0, l * pt[1].y), c, w)
+
+
+class Arrow extends Control:
+	var dir := 0  # 0 haut, 1 bas, 2 gauche, 3 droite
+
+	func _draw() -> void:
+		var c := size / 2.0
+		var r := minf(size.x, size.y) * 0.22
+		var pts := PackedVector2Array()
+		match dir:
+			0: pts = PackedVector2Array([c + Vector2(0, -r), c + Vector2(r, r), c + Vector2(-r, r)])
+			1: pts = PackedVector2Array([c + Vector2(0, r), c + Vector2(r, -r), c + Vector2(-r, -r)])
+			2: pts = PackedVector2Array([c + Vector2(-r, 0), c + Vector2(r, r), c + Vector2(r, -r)])
+			_: pts = PackedVector2Array([c + Vector2(r, 0), c + Vector2(-r, r), c + Vector2(-r, -r)])
+		draw_colored_polygon(pts, Color("d9ddd3"))
+
+
 class SelBox extends Control:
 	var r := Rect2()
 	var active := false
@@ -454,8 +603,8 @@ class SelBox extends Control:
 		if not active:
 			return
 		var rr := Rect2(r.position * size, r.size * size)
-		draw_rect(rr, Color(1, 0.3, 0.3, 0.25), true)
-		draw_rect(rr, Color("ff5555"), false, 2.0)
+		draw_rect(rr, Color(0.89, 0.64, 0.17, 0.2), true)
+		draw_rect(rr, Color("e3a32b"), false, 2.0)
 
 
 class Stick extends Control:
@@ -465,9 +614,15 @@ class Stick extends Control:
 	func _draw() -> void:
 		var c := size / 2.0
 		var r := minf(size.x, size.y) * 0.5
-		draw_circle(c, r, Color(1, 1, 1, 0.10))
-		draw_arc(c, r, 0.0, TAU, 48, Color(1, 1, 1, 0.35), 3.0)
-		draw_circle(c + v * r * 0.6, r * 0.36, Color(1, 1, 1, 0.55))
+		var acc := Color(0.89, 0.64, 0.17)
+		draw_circle(c, r, Color(0.05, 0.07, 0.06, 0.55))
+		draw_arc(c, r, 0.0, TAU, 64, Color(acc, 0.55), 1.5)
+		draw_arc(c, r * 0.45, 0.0, TAU, 48, Color(1, 1, 1, 0.12), 1.0)
+		for k in 4:
+			var d := Vector2.RIGHT.rotated(k * PI / 2.0)
+			draw_line(c + d * r * 0.86, c + d * r, Color(acc, 0.8), 1.5)
+		draw_circle(c + v * r * 0.6, r * 0.26, Color(acc, 0.5))
+		draw_arc(c + v * r * 0.6, r * 0.26, 0.0, TAU, 32, acc, 1.5)
 
 	func set_touch(pos: Vector2) -> void:
 		var c := get_global_rect().get_center()
@@ -490,14 +645,16 @@ class Wheel extends Control:
 		var c := size / 2.0
 		var r := minf(size.x, size.y) * 0.42
 		var a := steer * deg_to_rad(90.0)
-		draw_arc(c, r, 0.0, TAU, 64, Color("e8edf5"), 10.0)
-		draw_line(c, c + Vector2(cos(a), sin(a)) * r, Color("e8edf5"), 9.0)
-		draw_line(c, c + Vector2(cos(a + PI), sin(a + PI)) * r, Color("e8edf5"), 9.0)
-		draw_line(c, c + Vector2(cos(a + PI / 2.0), sin(a + PI / 2.0)) * r, Color("e8edf5"), 9.0)
-		draw_circle(c, 14.0, Color("e8edf5"))
-		draw_circle(c + Vector2(cos(a - PI / 2.0), sin(a - PI / 2.0)) * r, 9.0, Color("e5484d"))
+		var col := Color("d9ddd3")
+		draw_arc(c, r, 0.0, TAU, 64, col, 3.0)
+		draw_line(c, c + Vector2(cos(a), sin(a)) * r, col, 2.5)
+		draw_line(c, c + Vector2(cos(a + PI), sin(a + PI)) * r, col, 2.5)
+		draw_line(c, c + Vector2(cos(a + PI / 2.0), sin(a + PI / 2.0)) * r, col, 2.5)
+		draw_circle(c, 6.0, col)
+		draw_circle(c + Vector2(cos(a - PI / 2.0), sin(a - PI / 2.0)) * r, 5.0, Color("e3a32b"))
 
 
+## Zone tactile de la manette, placée par fractions de l'écran (centre cx, cy ; taille w, h).
 func _build_ui() -> void:
 	var bg := ColorRect.new()
 	bg.color = C_BG
@@ -509,48 +666,347 @@ func _build_ui() -> void:
 	var v := VBoxContainer.new()
 	v.add_theme_constant_override("separation", 8)
 	margin.add_child(v)
-	status_panel = PanelContainer.new()
-	v.add_child(status_panel)
-	var sv := VBoxContainer.new()
-	sv.add_theme_constant_override("separation", 2)
-	status_panel.add_child(sv)
-	status = Label.new()
-	status.add_theme_font_size_override("font_size", 20)
-	status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	sv.add_child(status)
-	sub = Label.new()
-	sub.add_theme_font_size_override("font_size", 13)
-	sub.modulate = Color(1, 1, 1, 0.8)
-	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	sv.add_child(sub)
+	_build_header(v)
 	upd_btn = Button.new()
+	upd_btn.theme_type_variation = "BtnAccent"
 	upd_btn.visible = false
-	upd_btn.custom_minimum_size = Vector2(0, 44)
 	upd_btn.pressed.connect(_do_update)
 	v.add_child(upd_btn)
 	if is_phone:
 		pend_box = VBoxContainer.new()
-		pend_box.add_theme_constant_override("separation", 10)
+		pend_box.add_theme_constant_override("separation", 6)
 		v.add_child(pend_box)
-	tabs = TabContainer.new()
-	tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	tabs.tabs_position = TabContainer.POSITION_BOTTOM
-	v.add_child(tabs)
-	var p1 := VBoxContainer.new()
-	p1.name = "Partage de son"
-	p1.add_theme_constant_override("separation", 10)
-	tabs.add_child(p1)
+		_build_chat_page(v)
+		_build_menu()
+	else:
+		var sc := ScrollContainer.new()
+		sc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		v.add_child(sc)
+		var col := VBoxContainer.new()
+		col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		col.add_theme_constant_override("separation", 16)
+		sc.add_child(col)
+		_sec_link(_section(col, "LIAISON"))
+		_sec_sound(_section(col, "SON"))
+		_sec_pad(_section(col, "MANETTE VIRTUELLE"))
+		_sec_chat_pc(_section(col, "CHAT ET IA"))
+		_sec_system(_section(col, "SYSTÈME"))
+
+
+## En-tête HUD : voyant + état, menu ; filet ambre dessous.
+func _build_header(v: VBoxContainer) -> void:
+	var hb := HBoxContainer.new()
+	hb.add_theme_constant_override("separation", 10)
+	v.add_child(hb)
+	led = Led.new()
+	led.custom_minimum_size = Vector2(16, 16)
+	led.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	hb.add_child(led)
+	status = Label.new()
+	status.theme_type_variation = "Section"
+	status.add_theme_font_size_override("font_size", 17)
+	status.add_theme_color_override("font_color", C_TXT)
+	status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	status.clip_text = true
+	hb.add_child(status)
+	if is_phone:
+		menu_btn = Button.new()
+		menu_btn.theme_type_variation = "BtnIcon"
+		menu_btn.icon = _icon("menu")
+		menu_btn.custom_minimum_size = Vector2(46, 40)
+		menu_btn.pressed.connect(func(): menu_ui.visible = true)
+		hb.add_child(menu_btn)
+	else:
+		var ver := Label.new()
+		ver.text = "ARMA REFORGER · V%s" % APP_VERSION
+		ver.theme_type_variation = "Caps"
+		hb.add_child(ver)
+	var line := ColorRect.new()
+	line.color = Color(C_ACC, 0.7)
+	line.custom_minimum_size = Vector2(0, 1)
+	v.add_child(line)
+	sub = Label.new()
+	sub.add_theme_font_size_override("font_size", 14)
+	sub.add_theme_color_override("font_color", C_BAD)
+	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	sub.visible = false
+	v.add_child(sub)
+
+
+## Section : titre ambre + filet ; renvoie le conteneur où ajouter le contenu.
+func _section(parent: Node, title: String) -> VBoxContainer:
+	var wrap := VBoxContainer.new()
+	wrap.add_theme_constant_override("separation", 8)
+	parent.add_child(wrap)
+	var hb := HBoxContainer.new()
+	hb.add_theme_constant_override("separation", 10)
+	wrap.add_child(hb)
+	var l := Label.new()
+	l.text = title
+	l.theme_type_variation = "Section"
+	hb.add_child(l)
+	var ln := ColorRect.new()
+	ln.color = C_LINE
+	ln.custom_minimum_size = Vector2(0, 1)
+	ln.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ln.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	hb.add_child(ln)
+	return wrap
+
+
+func _btn(text: String, variant := "", w := 0) -> Button:
+	var b := Button.new()
+	b.text = text
+	if variant != "":
+		b.theme_type_variation = variant
+	if w > 0:
+		b.custom_minimum_size = Vector2(w, 0)
+	return b
+
+
+func _switch(parent: Node, text: String, on: bool) -> CheckButton:
+	var c := CheckButton.new()
+	c.text = text
+	c.button_pressed = on
+	parent.add_child(c)
+	return c
+
+
+# ---- Page principale du téléphone : l'outil de chat
+
+func _build_chat_page(v: VBoxContainer) -> void:
+	var p := VBoxContainer.new()
+	p.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	p.add_theme_constant_override("separation", 8)
+	v.add_child(p)
+	shot_prev = TextureRect.new()
+	shot_prev.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	shot_prev.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	# saisie en haut : visible quand le clavier s'ouvre
+	var comp := PanelContainer.new()
+	comp.add_theme_stylebox_override("panel", _flat(C_PANEL, C_LINE, 1, 8, 8))
+	p.add_child(comp)
+	var cv := VBoxContainer.new()
+	cv.add_theme_constant_override("separation", 8)
+	comp.add_child(cv)
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	cv.add_child(row)
+	mic_btn = _btn("", "BtnIcon")
+	mic_btn.icon = _icon("mic")
+	mic_btn.custom_minimum_size = Vector2(46, 46)
+	mic_btn.pressed.connect(_dict_toggle)
+	row.add_child(mic_btn)
+	chat_edit = LineEdit.new()
+	chat_edit.placeholder_text = "Écrire un message"
+	chat_edit.max_length = 200
+	chat_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	chat_edit.custom_minimum_size = Vector2(0, 46)
+	chat_edit.text_submitted.connect(func(_t): _chat_submit(chat_edit))
+	row.add_child(chat_edit)
+	var sendb := _btn("ENVOYER", "BtnPrimary")
+	sendb.pressed.connect(func(): _chat_submit(chat_edit))
+	row.add_child(sendb)
+	var row2 := HBoxContainer.new()
+	row2.add_theme_constant_override("separation", 6)
+	cv.add_child(row2)
+	var tl := Label.new()
+	tl.text = "TRADUCTION"
+	tl.theme_type_variation = "Caps"
+	row2.add_child(tl)
+	lang_out_opt = OptionButton.new()
+	for l in LANGS:
+		lang_out_opt.add_item("AUCUNE" if l[0] == "Sans traduction" else str(l[0]).to_upper())
+	lang_out_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row2.add_child(lang_out_opt)
+	var fixb := _btn("CORRIGER", "BtnChip")
+	fixb.pressed.connect(func(): _ai_text("fix"))
+	row2.add_child(fixb)
+	var trb := _btn("TRADUIRE", "BtnChip")
+	trb.pressed.connect(func(): _ai_text("translate"))
+	row2.add_child(trb)
+	# flux : entête
+	var fh := HBoxContainer.new()
+	fh.add_theme_constant_override("separation", 6)
+	p.add_child(fh)
+	var ft := Label.new()
+	ft.text = "MESSAGES"
+	ft.theme_type_variation = "Section"
+	ft.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	fh.add_child(ft)
+	undo_btn = _btn("ANNULER", "BtnChip")
+	undo_btn.pressed.connect(_hist_undo)
+	fh.add_child(undo_btn)
+	clear_btn = _btn("VIDER", "BtnChip")
+	clear_btn.pressed.connect(_hist_clear)
+	fh.add_child(clear_btn)
+	for i in 2:
+		var vb := _btn(["LISTE", "IMAGE"][i], "BtnChip")
+		vb.toggle_mode = true
+		vb.pressed.connect(_set_view.bind(i))
+		fh.add_child(vb)
+		view_btns.append(vb)
+	zoom_box = HBoxContainer.new()
+	zoom_box.add_theme_constant_override("separation", 4)
+	fh.add_child(zoom_box)
+	var zo := _btn("−", "BtnChip")
+	zo.pressed.connect(func(): _chat_zoom(-1))
+	zoom_box.add_child(zo)
+	zoom_lbl = Label.new()
+	zoom_lbl.text = "×1"
+	zoom_lbl.theme_type_variation = "Mono"
+	zoom_box.add_child(zoom_lbl)
+	var zi := _btn("+", "BtnChip")
+	zi.pressed.connect(func(): _chat_zoom(1))
+	zoom_box.add_child(zi)
+	# flux : liste ou image, cadre à coins
+	var feed := PanelContainer.new()
+	feed.add_theme_stylebox_override("panel", _flat(Color("080b0a"), C_LINE, 1, 0, 0))
+	feed.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	p.add_child(feed)
+	list_panel = PanelContainer.new()
+	list_panel.add_theme_stylebox_override("panel", StyleBoxEmpty.new())
+	feed.add_child(list_panel)
+	var ls := ScrollContainer.new()
+	list_scroll = ls
+	ls.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	ls.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_NEVER
+	list_panel.add_child(ls)
+	var lm := MarginContainer.new()
+	for k in ["left", "right", "top", "bottom"]:
+		lm.add_theme_constant_override("margin_" + k, 10)
+	lm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ls.add_child(lm)
+	chat_list = VBoxContainer.new()
+	chat_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	chat_list.add_theme_constant_override("separation", 10)
+	lm.add_child(chat_list)
+	viewer_panel = PanelContainer.new()
+	viewer_panel.add_theme_stylebox_override("panel", StyleBoxEmpty.new())
+	viewer_panel.visible = false
+	feed.add_child(viewer_panel)
+	chat_scroll = ScrollContainer.new()
+	chat_scroll.resized.connect(_chat_zoom_apply)
+	viewer_panel.add_child(chat_scroll)
+	chat_scroll.add_child(shot_prev)
+	sel_box = SelBox.new()
+	sel_box.set_anchors_preset(Control.PRESET_FULL_RECT)
+	sel_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	shot_prev.add_child(sel_box)
+	shot_prev.mouse_filter = Control.MOUSE_FILTER_STOP
+	shot_prev.gui_input.connect(_sel_input)
+	var hf := HudFrame.new()
+	hf.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	feed.add_child(hf)
+	# action principale, au pouce
+	chat_status = Label.new()
+	chat_status.theme_type_variation = "Mono"
+	chat_status.add_theme_font_size_override("font_size", 12)
+	chat_status.clip_text = true
+	p.add_child(chat_status)
+	var cam := _btn("LIRE LE CHAT", "BtnAccent")
+	cam.icon = _icon("cam")
+	cam.custom_minimum_size = Vector2(0, 54)
+	cam.button_down.connect(_cam_down)
+	cam.button_up.connect(_cam_up)
+	p.add_child(cam)
+	_set_view(0)
+	_hist_load()
+	_chat_show_list(chat_hist)
+
+
+# ---- Menu (téléphone) : tout le reste
+
+func _build_menu() -> void:
+	menu_ui = Control.new()
+	menu_ui.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_ui.visible = false
+	var bg := ColorRect.new()
+	bg.color = C_BG
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_ui.add_child(bg)
+	menu_margin = MarginContainer.new()
+	menu_margin.set_anchors_preset(Control.PRESET_FULL_RECT)
+	menu_ui.add_child(menu_margin)
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 10)
+	menu_margin.add_child(v)
+	var hb := HBoxContainer.new()
+	v.add_child(hb)
+	var t := Label.new()
+	t.text = "MENU"
+	t.theme_type_variation = "Section"
+	t.add_theme_font_size_override("font_size", 17)
+	t.add_theme_color_override("font_color", C_TXT)
+	t.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hb.add_child(t)
+	var cl := _btn("FERMER", "BtnChip")
+	cl.pressed.connect(func(): menu_ui.visible = false)
+	hb.add_child(cl)
+	var line := ColorRect.new()
+	line.color = Color(C_ACC, 0.7)
+	line.custom_minimum_size = Vector2(0, 1)
+	v.add_child(line)
+	var sc := ScrollContainer.new()
+	sc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	sc.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_NEVER
+	v.add_child(sc)
+	var col := VBoxContainer.new()
+	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	col.add_theme_constant_override("separation", 18)
+	sc.add_child(col)
+	_sec_link(_section(col, "LIAISON"))
+	_sec_capture(_section(col, "CAPTURE DU CHAT"))
+	_sec_sound(_section(col, "SON"))
+	_sec_pad(_section(col, "MANETTE"))
+	_sec_system(_section(col, "SYSTÈME"))
+	add_child(menu_ui)
+
+
+func _sec_link(p: VBoxContainer) -> void:
+	link_lbl = Label.new()
+	link_lbl.theme_type_variation = "Mono"
+	link_lbl.add_theme_font_size_override("font_size", 16)
+	link_lbl.add_theme_color_override("font_color", C_TXT)
+	p.add_child(link_lbl)
+	if is_phone:
+		host_box = VBoxContainer.new()
+		host_box.add_theme_constant_override("separation", 6)
+		p.add_child(host_box)
+	else:
+		host_check = CheckButton.new()
+		host_check.text = "Mode hôte (le téléphone choisit ce PC)"
+		var cf := ConfigFile.new()
+		host_check.button_pressed = not (cf.load("user://pref.cfg") == OK and not bool(cf.get_value("pc", "host", true)))
+		host_check.toggled.connect(_set_host)
+		p.add_child(host_check)
+		link_opt = OptionButton.new()
+		for t in ["LIAISON AUTO", "LIAISON WI-FI", "LIAISON CÂBLE USB"]:
+			link_opt.add_item(t)
+		link_opt.item_selected.connect(func(i):
+			link_mode = i
+			_reconnect())
+		p.add_child(link_opt)
+	var rb := _btn("RECONNECTER", "BtnChip")
+	rb.pressed.connect(_reconnect)
+	p.add_child(rb)
+
+
+func _sec_sound(p: VBoxContainer) -> void:
 	bar = ProgressBar.new()
 	bar.max_value = 1.0
 	bar.show_percentage = false
-	bar.custom_minimum_size = Vector2(0, 14)
-	p1.add_child(bar)
+	bar.custom_minimum_size = Vector2(0, 4)
+	p.add_child(bar)
 	if is_phone:
 		var vr := HBoxContainer.new()
 		vr.add_theme_constant_override("separation", 12)
-		p1.add_child(vr)
+		p.add_child(vr)
 		var l := Label.new()
-		l.text = "Volume"
+		l.text = "VOLUME"
+		l.theme_type_variation = "Caps"
 		vr.add_child(l)
 		vol_slider = HSlider.new()
 		vol_slider.min_value = 0.0
@@ -558,33 +1014,161 @@ func _build_ui() -> void:
 		vol_slider.step = 0.01
 		vol_slider.value = 1.0
 		vol_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		vol_slider.custom_minimum_size = Vector2(0, 32)
+		vol_slider.custom_minimum_size = Vector2(0, 30)
 		vr.add_child(vol_slider)
-		sound_check = CheckButton.new()
-		sound_check.text = "Son du PC"
-		sound_check.button_pressed = true
+		sound_check = _switch(p, "Son du PC", true)
 		sound_check.toggled.connect(func(_on): _send_ctrl())
-		p1.add_child(sound_check)
-		mic_check = CheckButton.new()
-		mic_check.text = "Micro vers le PC"
-		mic_check.button_pressed = false
+		mic_check = _switch(p, "Micro vers le PC", false)
 		mic_check.toggled.connect(func(_on): _send_ctrl())
-		p1.add_child(mic_check)
 	else:
-		out_check = CheckButton.new()
-		out_check.text = "Son du PC → téléphone"
-		out_check.button_pressed = true
+		out_check = _switch(p, "Son du PC → téléphone".replace("→", "vers le"), true)
 		out_check.toggled.connect(func(_on): _pc_route())
-		p1.add_child(out_check)
-		mic_check = CheckButton.new()
-		mic_check.text = "Micro du téléphone"
-		mic_check.button_pressed = true
-		p1.add_child(mic_check)
-	_build_game_tab()
-	_build_net_tab()
+		mic_check = _switch(p, "Micro du téléphone", true)
 
 
-## Zone tactile de la manette, placée par fractions de l'écran (centre cx, cy ; taille w, h).
+func _sec_pad(p: VBoxContainer) -> void:
+	drive_info = Label.new()
+	drive_info.theme_type_variation = "Mono"
+	drive_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	if is_phone:
+		drive_info.visible = false
+		p.add_child(drive_info)
+		var ob := _btn("OUVRIR LA MANETTE", "BtnAccent")
+		ob.pressed.connect(func():
+			menu_ui.visible = false
+			_open_pad(true))
+		p.add_child(ob)
+		var vc := _switch(p, "Vibrations", true)
+		vc.toggled.connect(func(on): vib_on = on)
+		_build_pad_ui()
+	else:
+		drive_info.text = "Manette « USB Speaker Volant »"
+		p.add_child(drive_info)
+		wheel = Wheel.new()
+		wheel.custom_minimum_size = Vector2(0, 100)
+		p.add_child(wheel)
+		drive_check = _switch(p, "Manette virtuelle", true)
+
+
+func _sec_capture(p: VBoxContainer) -> void:
+	for d in [["X", 0, 90, 0], ["Y", 0, 90, 0], ["LARG.", 10, 100, 35], ["HAUT.", 5, 100, 30], ["DURÉE", 2, 20, 6]]:
+		var hr := HBoxContainer.new()
+		p.add_child(hr)
+		var l := Label.new()
+		l.text = d[0]
+		l.theme_type_variation = "Caps"
+		l.custom_minimum_size = Vector2(60, 0)
+		hr.add_child(l)
+		var sl := HSlider.new()
+		sl.min_value = d[1]
+		sl.max_value = d[2]
+		sl.value = d[3]
+		sl.step = 1
+		sl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		sl.custom_minimum_size = Vector2(0, 28)
+		hr.add_child(sl)
+		shot_sl.append(sl)
+	var ih := HBoxContainer.new()
+	p.add_child(ih)
+	var il := Label.new()
+	il.text = "INTERVALLE"
+	il.theme_type_variation = "Caps"
+	il.custom_minimum_size = Vector2(60, 0)
+	ih.add_child(il)
+	cap_int_sl = HSlider.new()
+	cap_int_sl.min_value = 1
+	cap_int_sl.max_value = 10
+	cap_int_sl.value = 3
+	cap_int_sl.step = 1
+	cap_int_sl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cap_int_sl.custom_minimum_size = Vector2(0, 28)
+	ih.add_child(cap_int_sl)
+	sel_tg = _btn("CHOISIR LA ZONE SUR L'ÉCRAN DU PC", "BtnChip")
+	sel_tg.pressed.connect(_sel_start)
+	p.add_child(sel_tg)
+	chat_enter = _switch(p, "« ! » puis Entrée autour de la capture", true)
+	tr_in_check = _switch(p, "Traduire les messages reçus en français", true)
+	var tr2 := HBoxContainer.new()
+	p.add_child(tr2)
+	var tl2 := Label.new()
+	tl2.text = "DICTÉE"
+	tl2.theme_type_variation = "Caps"
+	tl2.custom_minimum_size = Vector2(80, 0)
+	tr2.add_child(tl2)
+	lang_in_opt = OptionButton.new()
+	for l in [LANGS[10]] + LANGS.slice(1, 10):
+		lang_in_opt.add_item(str(l[0]).to_upper())
+	lang_in_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tr2.add_child(lang_in_opt)
+	var tr3 := HBoxContainer.new()
+	p.add_child(tr3)
+	var tl3 := Label.new()
+	tl3.text = "TON IA"
+	tl3.theme_type_variation = "Caps"
+	tl3.custom_minimum_size = Vector2(80, 0)
+	tr3.add_child(tl3)
+	tone_opt = OptionButton.new()
+	for t in ["Amical", "Sérieux", "Humoristique", "Militaire"]:
+		tone_opt.add_item(t.to_upper())
+	tone_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tr3.add_child(tone_opt)
+
+
+func _sec_chat_pc(p: VBoxContainer) -> void:
+	shot_info = Label.new()
+	shot_info.theme_type_variation = "Mono"
+	p.add_child(shot_info)
+	chat_allow = CheckButton.new()
+	chat_allow.text = "Saisie de texte depuis le téléphone"
+	var cfc := ConfigFile.new()
+	chat_allow.button_pressed = cfc.load("user://pref.cfg") == OK and bool(cfc.get_value("pc", "chat", false))
+	chat_allow.toggled.connect(func(on):
+		var c := ConfigFile.new()
+		c.load("user://pref.cfg")
+		c.set_value("pc", "chat", on)
+		c.save("user://pref.cfg"))
+	p.add_child(chat_allow)
+	ai_opt = OptionButton.new()
+	ai_opt.item_selected.connect(func(i):
+		ai_model = ai_opt.get_item_text(i)
+		var c := ConfigFile.new()
+		c.load("user://pref.cfg")
+		c.set_value("pc", "ai_model", ai_model)
+		c.save("user://pref.cfg"))
+	p.add_child(ai_opt)
+	shot_prev = TextureRect.new()
+	shot_prev.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	shot_prev.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	shot_prev.custom_minimum_size = Vector2(0, 130)
+	p.add_child(shot_prev)
+
+
+func _sec_system(p: VBoxContainer) -> void:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 8)
+	p.add_child(row)
+	upd_status = Label.new()
+	upd_status.text = "v%s" % APP_VERSION
+	upd_status.theme_type_variation = "Mono"
+	upd_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	upd_status.clip_text = true
+	row.add_child(upd_status)
+	var ub := _btn("VÉRIFIER", "BtnChip")
+	ub.pressed.connect(func(): _check_update(true))
+	row.add_child(ub)
+	if not is_phone:
+		auto_upd = CheckButton.new()
+		auto_upd.text = "Mises à jour automatiques"
+		var cf2 := ConfigFile.new()
+		auto_upd.button_pressed = not (cf2.load("user://pref.cfg") == OK and not bool(cf2.get_value("pc", "auto_update", true)))
+		auto_upd.toggled.connect(func(on):
+			var c := ConfigFile.new()
+			c.load("user://pref.cfg")
+			c.set_value("pc", "auto_update", on)
+			c.save("user://pref.cfg"))
+		p.add_child(auto_upd)
+
+
 func _pz(id: String, txt: String, col: Color, cx: float, cy: float, w: float, h: float, fs := 24) -> Panel:
 	var p := Panel.new()
 	p.name = id
@@ -597,18 +1181,25 @@ func _pz(id: String, txt: String, col: Color, cx: float, cy: float, w: float, h:
 	p.offset_top = -h / 2.0
 	p.offset_bottom = h / 2.0
 	p.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = col
-	sb.set_corner_radius_all(int(minf(w, h) * 0.3))
-	p.add_theme_stylebox_override("panel", sb)
-	var l := Label.new()
-	l.text = txt
-	l.set_anchors_preset(Control.PRESET_FULL_RECT)
-	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	l.add_theme_font_size_override("font_size", fs)
-	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	p.add_child(l)
+	p.add_theme_stylebox_override("panel", _flat(Color(0.05, 0.07, 0.06, 0.78), Color(col.r, col.g, col.b, 0.9), 1, 0, 0))
+	var arrows := ["^", "v", "<", ">"]
+	if txt in arrows:
+		var a := Arrow.new()
+		a.dir = arrows.find(txt)
+		a.set_anchors_preset(Control.PRESET_FULL_RECT)
+		a.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		p.add_child(a)
+	else:
+		var l := Label.new()
+		l.text = txt.to_upper()
+		l.set_anchors_preset(Control.PRESET_FULL_RECT)
+		l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		l.add_theme_font_override("font", f_caps)
+		l.add_theme_font_size_override("font_size", fs)
+		l.add_theme_color_override("font_color", Color(col.r, col.g, col.b, 1.0).lerp(C_TXT, 0.35))
+		l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		p.add_child(l)
 	pad_safe.add_child(p)
 	pad_zones.append(p)
 	return p
@@ -617,280 +1208,182 @@ func _pz(id: String, txt: String, col: Color, cx: float, cy: float, w: float, h:
 func _pbtn(txt: String, cx: float, w: float) -> Button:
 	var b := Button.new()
 	b.text = txt
+	b.theme_type_variation = "BtnChip"
 	b.anchor_left = cx
 	b.anchor_right = cx
 	b.offset_left = -w / 2.0
 	b.offset_right = w / 2.0
 	b.offset_top = 6.0
 	b.offset_bottom = 40.0
-	b.add_theme_font_size_override("font_size", 14)
 	pad_safe.add_child(b)
 	return b
-
-
-func _build_game_tab() -> void:
-	var jeu := VBoxContainer.new()
-	jeu.name = "Jeu"
-	jeu.add_theme_constant_override("separation", 8)
-	tabs.add_child(jeu)
-	var gl := Label.new()
-	gl.text = "Arma Reforger"
-	gl.add_theme_font_size_override("font_size", 22)
-	gl.add_theme_color_override("font_color", C_ACC)
-	jeu.add_child(gl)
-	var arma := TabContainer.new()
-	arma.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	jeu.add_child(arma)
-	_build_drive_tab(arma)
-	_build_screen_tab(arma)
-	if is_phone:
-		arma.tab_changed.connect(func(i): if i == 0: _open_pad(true))
-
-
-func _build_screen_tab(parent: Node) -> void:
-	var p := VBoxContainer.new()
-	p.name = "Chat"
-	p.add_theme_constant_override("separation", 8)
-	parent.add_child(p)
-	shot_prev = TextureRect.new()
-	shot_prev.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	shot_prev.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	if is_phone:
-		# 1) saisie en haut (reste visible quand le clavier s'ouvre)
-		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 6)
-		p.add_child(row)
-		mic_btn = Button.new()
-		mic_btn.icon = _mic_tex()
-		mic_btn.custom_minimum_size = Vector2(48, 44)
-		mic_btn.pressed.connect(_dict_toggle)
-		row.add_child(mic_btn)
-		chat_edit = LineEdit.new()
-		chat_edit.placeholder_text = "Message du chat"
-		chat_edit.max_length = 200
-		chat_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		chat_edit.custom_minimum_size = Vector2(0, 44)
-		chat_edit.text_submitted.connect(func(_t): _chat_submit(chat_edit))
-		row.add_child(chat_edit)
-		var cb := Button.new()
-		cb.text = "Envoyer"
-		cb.custom_minimum_size = Vector2(0, 44)
-		cb.pressed.connect(func(): _chat_submit(chat_edit))
-		row.add_child(cb)
-		var row2 := HBoxContainer.new()
-		row2.add_theme_constant_override("separation", 6)
-		p.add_child(row2)
-		lang_out_opt = OptionButton.new()
-		for l in LANGS:
-			lang_out_opt.add_item(("→ " + l[0]) if l[0] != "Sans traduction" else l[0])
-		lang_out_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		row2.add_child(lang_out_opt)
-		var fixb := Button.new()
-		fixb.text = "Corriger"
-		fixb.pressed.connect(func(): _ai_text("fix"))
-		row2.add_child(fixb)
-		var trb := Button.new()
-		trb.text = "Traduire"
-		trb.pressed.connect(func(): _ai_text("translate"))
-		row2.add_child(trb)
-		# 2) barre : capture, vues, zoom
-		var tb := HBoxContainer.new()
-		tb.add_theme_constant_override("separation", 6)
-		p.add_child(tb)
-		var cam := Button.new()
-		cam.icon = _cam_tex()
-		cam.custom_minimum_size = Vector2(48, 40)
-		cam.pressed.connect(func(): _request_shot(true))
-		tb.add_child(cam)
-		for i in 2:
-			var vb := Button.new()
-			vb.text = ["Liste", "Image"][i]
-			vb.toggle_mode = true
-			vb.custom_minimum_size = Vector2(0, 40)
-			vb.pressed.connect(_set_view.bind(i))
-			tb.add_child(vb)
-			view_btns.append(vb)
-		zoom_box = HBoxContainer.new()
-		zoom_box.add_theme_constant_override("separation", 4)
-		tb.add_child(zoom_box)
-		var zo := Button.new()
-		zo.text = "−"
-		zo.custom_minimum_size = Vector2(40, 40)
-		zo.pressed.connect(func(): _chat_zoom(-1))
-		zoom_box.add_child(zo)
-		zoom_lbl = Label.new()
-		zoom_lbl.text = "×1"
-		zoom_box.add_child(zoom_lbl)
-		var zi := Button.new()
-		zi.text = "+"
-		zi.custom_minimum_size = Vector2(40, 40)
-		zi.pressed.connect(func(): _chat_zoom(1))
-		zoom_box.add_child(zi)
-		var sp := Control.new()
-		sp.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		tb.add_child(sp)
-		chat_status = Label.new()
-		chat_status.add_theme_font_size_override("font_size", 13)
-		chat_status.modulate = Color(1, 1, 1, 0.7)
-		chat_status.clip_text = true
-		tb.add_child(chat_status)
-		var gear := Button.new()
-		gear.text = "⚙"
-		gear.custom_minimum_size = Vector2(40, 40)
-		tb.add_child(gear)
-		# 3) liste des messages / image
-		list_panel = PanelContainer.new()
-		list_panel.add_theme_stylebox_override("panel", _sbox(Color("07090d"), 10, 4, 4, C_BG3, 2))
-		list_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
-		p.add_child(list_panel)
-		var ls := ScrollContainer.new()
-		ls.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-		list_panel.add_child(ls)
-		chat_list = VBoxContainer.new()
-		chat_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		chat_list.add_theme_constant_override("separation", 6)
-		ls.add_child(chat_list)
-		viewer_panel = PanelContainer.new()
-		viewer_panel.add_theme_stylebox_override("panel", _sbox(Color("07090d"), 10, 4, 4, C_BG3, 2))
-		viewer_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
-		viewer_panel.visible = false
-		p.add_child(viewer_panel)
-		chat_scroll = ScrollContainer.new()
-		chat_scroll.resized.connect(_chat_zoom_apply)
-		viewer_panel.add_child(chat_scroll)
-		chat_scroll.add_child(shot_prev)
-		sel_box = SelBox.new()
-		sel_box.set_anchors_preset(Control.PRESET_FULL_RECT)
-		sel_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		shot_prev.add_child(sel_box)
-		shot_prev.mouse_filter = Control.MOUSE_FILTER_STOP
-		shot_prev.gui_input.connect(_sel_input)
-		# 4) réglages repliés
-		var box := VBoxContainer.new()
-		box.visible = false
-		box.add_theme_constant_override("separation", 4)
-		p.add_child(box)
-		gear.pressed.connect(func(): box.visible = not box.visible)
-		for d in [["X", 0, 90, 0], ["Y", 0, 90, 0], ["Larg.", 10, 100, 35], ["Haut.", 5, 100, 30], ["Durée", 2, 20, 6]]:
-			var hr := HBoxContainer.new()
-			box.add_child(hr)
-			var l := Label.new()
-			l.text = d[0]
-			l.custom_minimum_size = Vector2(56, 0)
-			hr.add_child(l)
-			var sl := HSlider.new()
-			sl.min_value = d[1]
-			sl.max_value = d[2]
-			sl.value = d[3]
-			sl.step = 1
-			sl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			sl.custom_minimum_size = Vector2(0, 28)
-			hr.add_child(sl)
-			shot_sl.append(sl)
-		sel_tg = Button.new()
-		sel_tg.text = "Choisir la zone sur l'écran du PC"
-		sel_tg.pressed.connect(_sel_start)
-		box.add_child(sel_tg)
-		chat_enter = CheckButton.new()
-		chat_enter.text = "« ! » puis Entrée autour de la capture"
-		chat_enter.button_pressed = true
-		box.add_child(chat_enter)
-		tr_in_check = CheckButton.new()
-		tr_in_check.text = "Traduire les messages reçus en français"
-		tr_in_check.button_pressed = true
-		box.add_child(tr_in_check)
-		var tr2 := HBoxContainer.new()
-		box.add_child(tr2)
-		var tl2 := Label.new()
-		tl2.text = "Dictée"
-		tl2.custom_minimum_size = Vector2(70, 0)
-		tr2.add_child(tl2)
-		lang_in_opt = OptionButton.new()
-		for l in [LANGS[10]] + LANGS.slice(1, 10):
-			lang_in_opt.add_item(l[0])
-		lang_in_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		tr2.add_child(lang_in_opt)
-		var tr3 := HBoxContainer.new()
-		box.add_child(tr3)
-		var tl3 := Label.new()
-		tl3.text = "Ton IA"
-		tl3.custom_minimum_size = Vector2(70, 0)
-		tr3.add_child(tl3)
-		tone_opt = OptionButton.new()
-		for t in ["Amical", "Sérieux", "Humoristique", "Militaire"]:
-			tone_opt.add_item(t)
-		tone_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		tr3.add_child(tone_opt)
-		_set_view(0)
-	else:
-		shot_info = Label.new()
-		p.add_child(shot_info)
-		chat_allow = CheckButton.new()
-		chat_allow.text = "Saisie de texte depuis le téléphone"
-		var cfc := ConfigFile.new()
-		chat_allow.button_pressed = cfc.load("user://pref.cfg") == OK and bool(cfc.get_value("pc", "chat", false))
-		chat_allow.toggled.connect(func(on):
-			var c := ConfigFile.new()
-			c.load("user://pref.cfg")
-			c.set_value("pc", "chat", on)
-			c.save("user://pref.cfg"))
-		p.add_child(chat_allow)
-		ai_opt = OptionButton.new()
-		ai_opt.item_selected.connect(func(i):
-			ai_model = ai_opt.get_item_text(i)
-			var c := ConfigFile.new()
-			c.load("user://pref.cfg")
-			c.set_value("pc", "ai_model", ai_model)
-			c.save("user://pref.cfg"))
-		p.add_child(ai_opt)
-		shot_prev.custom_minimum_size = Vector2(0, 150)
-		p.add_child(shot_prev)
 
 
 func _set_view(v: int) -> void:
 	list_panel.visible = v == 0
 	viewer_panel.visible = v == 1
 	zoom_box.visible = v == 1
+	undo_btn.visible = v == 0
+	clear_btn.visible = v == 0
 	for i in view_btns.size():
 		view_btns[i].button_pressed = i == v
 
 
 func _chat_show_list(entries: Array) -> void:
+	var near_bottom := true
+	if list_scroll != null and list_scroll.get_v_scroll_bar().max_value > 0.0:
+		near_bottom = list_scroll.scroll_vertical + list_scroll.size.y >= list_scroll.get_v_scroll_bar().max_value - 80.0
 	chat_entries = entries
 	for c in chat_list.get_children():
 		c.queue_free()
+	if entries.is_empty():
+		var e0 := Label.new()
+		e0.text = "AUCUN MESSAGE"
+		e0.theme_type_variation = "Caps"
+		e0.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		e0.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		e0.custom_minimum_size = Vector2(0, 120)
+		chat_list.add_child(e0)
+		return
 	for i in entries.size():
 		var e: Dictionary = entries[i]
-		var card := PanelContainer.new()
-		card.add_theme_stylebox_override("panel", _sbox(C_BG2, 10, 10, 8))
-		chat_list.add_child(card)
+		var me: bool = e.get("me", false)
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", 10)
+		chat_list.add_child(row)
+		var barc := ColorRect.new()
+		barc.color = C_OK if me else C_ACC
+		barc.custom_minimum_size = Vector2(3, 0)
+		row.add_child(barc)
 		var v := VBoxContainer.new()
+		v.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		v.add_theme_constant_override("separation", 2)
-		card.add_child(v)
+		row.add_child(v)
 		var top := HBoxContainer.new()
+		top.add_theme_constant_override("separation", 8)
 		v.add_child(top)
 		var nl := Label.new()
-		nl.text = str(e.get("n", ""))
-		nl.add_theme_color_override("font_color", C_ACC)
-		nl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		nl.text = str(e.get("n", "")).to_upper()
+		nl.theme_type_variation = "Name"
 		nl.clip_text = true
 		top.add_child(nl)
-		var ib := Button.new()
-		ib.text = "IA"
-		ib.custom_minimum_size = Vector2(52, 32)
-		ib.pressed.connect(_ai_reply.bind(i))
-		top.add_child(ib)
+		var tm := Label.new()
+		tm.text = _hist_time(int(e.get("ts", 0)))
+		tm.theme_type_variation = "Mono"
+		tm.add_theme_font_size_override("font_size", 12)
+		tm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		top.add_child(tm)
+		if not me:
+			var ib := _btn("RÉPONDRE", "BtnChip")
+			ib.pressed.connect(_ai_reply.bind(i))
+			top.add_child(ib)
+		var xb := _btn("X", "BtnChip")
+		xb.pressed.connect(_hist_delete.bind(i))
+		top.add_child(xb)
 		var ml := Label.new()
 		ml.text = str(e.get("m", ""))
 		ml.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		v.add_child(ml)
 		if e.has("t"):
 			var tl := Label.new()
-			tl.text = "→ " + str(e["t"])
+			tl.text = "» " + str(e["t"])
 			tl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-			tl.add_theme_color_override("font_color", Color("7fd48b"))
-			tl.add_theme_font_size_override("font_size", 14)
+			tl.add_theme_color_override("font_color", C_OK)
+			tl.add_theme_font_size_override("font_size", 16)
 			v.add_child(tl)
+	if near_bottom and list_scroll != null:
+		await get_tree().process_frame
+		await get_tree().process_frame
+		list_scroll.scroll_vertical = int(list_scroll.get_v_scroll_bar().max_value)
+
+
+const HIST_FILE := "user://chat_history.json"
+
+
+func _hist_load() -> void:
+	if not FileAccess.file_exists(HIST_FILE):
+		return
+	var d = JSON.parse_string(FileAccess.get_file_as_string(HIST_FILE))
+	if typeof(d) == TYPE_ARRAY:
+		chat_hist = d
+		for h in chat_hist:
+			hist_batch = maxi(hist_batch, int(h.get("b", 0)))
+
+
+func _hist_save() -> void:
+	var f := FileAccess.open(HIST_FILE, FileAccess.WRITE)
+	if f != null:
+		f.store_string(JSON.stringify(chat_hist.slice(maxi(0, chat_hist.size() - 300))))
+
+
+func _hist_time(ts: int) -> String:
+	var bias := int(Time.get_time_zone_from_system()["bias"]) * 60
+	var d := Time.get_datetime_dict_from_unix_time(ts + bias)
+	var today := Time.get_datetime_dict_from_unix_time(int(Time.get_unix_time_from_system()) + bias)
+	if d["day"] != today["day"] or d["month"] != today["month"]:
+		return "%02d/%02d %02d:%02d" % [d["day"], d["month"], d["hour"], d["minute"]]
+	return "%02d:%02d" % [d["hour"], d["minute"]]
+
+
+func _hist_find(n: String, m: String) -> int:
+	var nm := m.to_lower()
+	var nn := n.to_lower()
+	for i in range(chat_hist.size() - 1, maxi(-1, chat_hist.size() - 61), -1):
+		var h: Dictionary = chat_hist[i]
+		if str(h["m"]).to_lower().similarity(nm) >= 0.85 \
+				and (nm.length() >= 12 or str(h["n"]).to_lower().similarity(nn) >= 0.6 or h.get("me", false)):
+			return i
+	return -1
+
+
+## Ajoute seulement les nouveaux messages (les captures répétées se recoupent).
+func _hist_merge(entries: Array) -> void:
+	var now := int(Time.get_unix_time_from_system())
+	for e in entries:
+		var i := _hist_find(str(e.get("n", "")), str(e.get("m", "")))
+		if i >= 0:
+			if e.has("t") and not chat_hist[i].has("t"):
+				chat_hist[i]["t"] = e["t"]
+		else:
+			var h := {"n": str(e.get("n", "")), "m": str(e.get("m", "")), "ts": now, "b": hist_batch}
+			if e.has("t"):
+				h["t"] = e["t"]
+			chat_hist.append(h)
+	if chat_hist.size() > 300:
+		chat_hist = chat_hist.slice(chat_hist.size() - 300)
+	_hist_save()
+
+
+func _hist_undo() -> void:
+	if chat_hist.is_empty():
+		return
+	var last := 0
+	for h in chat_hist:
+		last = maxi(last, int(h.get("b", 0)))
+	chat_hist = chat_hist.filter(func(h): return int(h.get("b", 0)) != last)
+	_hist_save()
+	chat_status.text = "Dernière capture annulée"
+	_chat_show_list(chat_hist)
+
+
+func _hist_clear() -> void:
+	if Time.get_ticks_msec() > clear_armed:
+		clear_armed = Time.get_ticks_msec() + 2500
+		clear_btn.text = "CONFIRMER ?"
+		get_tree().create_timer(2.6).timeout.connect(func(): clear_btn.text = "VIDER")
+		return
+	clear_armed = 0
+	clear_btn.text = "VIDER"
+	chat_hist = []
+	_hist_save()
+	_chat_show_list(chat_hist)
+
+
+func _hist_delete(i: int) -> void:
+	if i >= 0 and i < chat_hist.size():
+		chat_hist.remove_at(i)
+		_hist_save()
+		_chat_show_list(chat_hist)
 
 
 func _ai_send(d: Dictionary) -> void:
@@ -900,10 +1393,11 @@ func _ai_send(d: Dictionary) -> void:
 
 func _ai_reply(i: int) -> void:
 	var ctx: Array = []
-	for k in range(maxi(0, i - 6), i + 1):
-		ctx.append("%s: %s" % [chat_entries[k].get("n", ""), chat_entries[k].get("m", "")])
-	_ai_send({"op": "reply", "text": str(chat_entries[i].get("m", "")), "n": str(chat_entries[i].get("n", "")),
-			"ctx": ctx, "tone": tone_opt.selected})
+	for k in range(maxi(0, i - 14), i + 1):
+		var h: Dictionary = chat_hist[k]
+		ctx.append("[%s] %s: %s" % [_hist_time(int(h.get("ts", 0))), h.get("n", ""), h.get("m", "")])
+	_ai_send({"op": "reply", "text": str(chat_hist[i].get("m", "")), "n": str(chat_hist[i].get("n", "")),
+			"ctx": ctx, "tone": tone_opt.selected, "now": _hist_time(int(Time.get_unix_time_from_system()))})
 
 
 func _ai_text(op: String) -> void:
@@ -999,6 +1493,7 @@ func _chat_zoom_apply() -> void:
 
 ## Choix de la zone : le PC envoie tout l'écran, on dessine un rectangle dessus.
 func _sel_start() -> void:
+	menu_ui.visible = false
 	_set_view(1)
 	chat_zoom = 1.0
 	zoom_lbl.text = "×1"
@@ -1040,98 +1535,6 @@ func _sel_input(ev: InputEvent) -> void:
 		var b: Vector2 = (ev.position / sz).clamp(Vector2.ZERO, Vector2.ONE)
 		sel_box.r = Rect2(sel_a, b - sel_a).abs()
 		sel_box.queue_redraw()
-
-
-func _build_drive_tab(parent: Node) -> void:
-	var p := VBoxContainer.new()
-	p.name = "Manette"
-	p.add_theme_constant_override("separation", 8)
-	parent.add_child(p)
-	drive_info = Label.new()
-	drive_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	drive_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	p.add_child(drive_info)
-	if is_phone:
-		drive_info.visible = false
-		var ob := Button.new()
-		ob.text = "Ouvrir la manette"
-		ob.custom_minimum_size = Vector2(0, 48)
-		ob.pressed.connect(func(): _open_pad(true))
-		p.add_child(ob)
-		var vc := CheckButton.new()
-		vc.text = "Vibrations"
-		vc.button_pressed = true
-		vc.toggled.connect(func(on): vib_on = on)
-		p.add_child(vc)
-		_build_pad_ui()
-	else:
-		wheel = Wheel.new()
-		wheel.custom_minimum_size = Vector2(0, 110)
-		p.add_child(wheel)
-		drive_info.text = "Manette « USB Speaker Volant »"
-		drive_check = CheckButton.new()
-		drive_check.text = "Manette virtuelle"
-		drive_check.button_pressed = true
-		p.add_child(drive_check)
-
-
-func _build_net_tab() -> void:
-	var p := VBoxContainer.new()
-	p.name = "Connexion"
-	p.add_theme_constant_override("separation", 8)
-	tabs.add_child(p)
-	link_lbl = Label.new()
-	link_lbl.add_theme_font_size_override("font_size", 18)
-	p.add_child(link_lbl)
-	if is_phone:
-		host_box = VBoxContainer.new()
-		host_box.add_theme_constant_override("separation", 6)
-		p.add_child(host_box)
-	else:
-		host_check = CheckButton.new()
-		host_check.text = "Mode hôte"
-		var cf := ConfigFile.new()
-		host_check.button_pressed = not (cf.load("user://pref.cfg") == OK and not bool(cf.get_value("pc", "host", true)))
-		host_check.toggled.connect(_set_host)
-		p.add_child(host_check)
-		link_opt = OptionButton.new()
-		for t in ["Liaison : Auto", "Liaison : Wi-Fi", "Liaison : câble USB"]:
-			link_opt.add_item(t)
-		link_opt.item_selected.connect(func(i):
-			link_mode = i
-			_reconnect())
-		p.add_child(link_opt)
-		auto_upd = CheckButton.new()
-		auto_upd.text = "Mises à jour automatiques"
-		var cf2 := ConfigFile.new()
-		auto_upd.button_pressed = not (cf2.load("user://pref.cfg") == OK and not bool(cf2.get_value("pc", "auto_update", true)))
-		auto_upd.toggled.connect(func(on):
-			var c := ConfigFile.new()
-			c.load("user://pref.cfg")
-			c.set_value("pc", "auto_update", on)
-			c.save("user://pref.cfg"))
-		p.add_child(auto_upd)
-	var sp := Control.new()
-	sp.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	p.add_child(sp)
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 8)
-	p.add_child(row)
-	upd_status = Label.new()
-	upd_status.text = "v%s" % APP_VERSION
-	upd_status.modulate = Color(1, 1, 1, 0.7)
-	upd_status.add_theme_font_size_override("font_size", 14)
-	upd_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	upd_status.clip_text = true
-	row.add_child(upd_status)
-	var ub := Button.new()
-	ub.text = "Mises à jour"
-	ub.pressed.connect(func(): _check_update(true))
-	row.add_child(ub)
-	var rb := Button.new()
-	rb.text = "↻"
-	rb.pressed.connect(_reconnect)
-	row.add_child(rb)
 
 
 func _bcast_addrs() -> PackedStringArray:
@@ -1225,7 +1628,7 @@ func _build_pad_ui() -> void:
 	pad_ui.mouse_filter = Control.MOUSE_FILTER_STOP
 	pad_ui.visible = false
 	var bg := ColorRect.new()
-	bg.color = Color("0f1218")
+	bg.color = C_BG
 	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
 	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	pad_ui.add_child(bg)
@@ -1242,10 +1645,9 @@ func _build_pad_ui() -> void:
 	shot_frame.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	shot_frame.visible = false
 	var fsb := StyleBoxFlat.new()
-	fsb.bg_color = Color(0, 0, 0, 0.85)
-	fsb.border_color = Color("e8edf5")
-	fsb.set_border_width_all(3)
-	fsb.set_corner_radius_all(10)
+	fsb.bg_color = Color(0.03, 0.04, 0.03, 0.92)
+	fsb.border_color = C_ACC
+	fsb.set_border_width_all(1)
 	shot_frame.add_theme_stylebox_override("panel", fsb)
 	shot_view = TextureRect.new()
 	shot_view.set_anchors_preset(Control.PRESET_FULL_RECT)
@@ -1257,21 +1659,21 @@ func _build_pad_ui() -> void:
 	shot_view.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	shot_view.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	shot_frame.add_child(shot_view)
-	var g := Color(0.23, 0.26, 0.32, 0.75)
+	var g := Color("56635a")
 	_pz("LT", "LT", g, 0.12, 0.26, 120, 46, 18)
 	_pz("LB", "LB", g, 0.12, 0.40, 120, 40, 18)
 	_pz("RT", "RT", g, 0.88, 0.26, 120, 46, 18)
 	_pz("RB", "RB", g, 0.88, 0.40, 120, 40, 18)
 	_pz("Select", "Regarder", g, 0.43, 0.42, 96, 34, 13)
 	_pz("Start", "Menu", g, 0.57, 0.42, 64, 34, 13)
-	_pz("DUp", "▲", g, 0.385, 0.60, 52, 52, 18)
-	_pz("DDown", "▼", g, 0.385, 0.88, 52, 52, 18)
-	_pz("DLeft", "◀", g, 0.315, 0.74, 52, 52, 18)
-	_pz("DRight", "▶", g, 0.455, 0.74, 52, 52, 18)
-	_pz("Y", "Y", Color("d4a017cc"), 0.87, 0.52, 60, 60, 22)
-	_pz("A", "A", Color("27ae60cc"), 0.87, 0.86, 60, 60, 22)
-	_pz("X", "X", Color("2e86decc"), 0.80, 0.69, 60, 60, 22)
-	_pz("B", "B", Color("c0392bcc"), 0.94, 0.69, 60, 60, 22)
+	_pz("DUp", "^", g, 0.385, 0.60, 52, 52, 18)
+	_pz("DDown", "v", g, 0.385, 0.88, 52, 52, 18)
+	_pz("DLeft", "<", g, 0.315, 0.74, 52, 52, 18)
+	_pz("DRight", ">", g, 0.455, 0.74, 52, 52, 18)
+	_pz("Y", "Y", Color("e3a32b"), 0.87, 0.52, 60, 60, 22)
+	_pz("A", "A", Color("6fbf73"), 0.87, 0.86, 60, 60, 22)
+	_pz("X", "X", Color("5b8fd6"), 0.80, 0.69, 60, 60, 22)
+	_pz("B", "B", Color("d0493f"), 0.94, 0.69, 60, 60, 22)
 	lstick = Stick.new()
 	rstick = Stick.new()
 	for pair in [[lstick, 0.16], [rstick, 0.62]]:
@@ -1286,18 +1688,18 @@ func _build_pad_ui() -> void:
 		st.offset_bottom = 85.0
 		st.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		pad_safe.add_child(st)
-	var back := _pbtn("←", 0.05, 54)
+	var back := _pbtn("RETOUR", 0.07, 84)
 	back.pressed.connect(func(): _open_pad(false))
-	gyro_btn = _pbtn("Gyro", 0.13, 76)
+	gyro_btn = _pbtn("GYRO", 0.18, 66)
 	gyro_btn.toggle_mode = true
 	gyro_btn.toggled.connect(func(on):
 		gyro_on = on
-		gyro_btn.text = "Gyro ●" if on else "Gyro"
+		gyro_btn.text = "GYRO ON" if on else "GYRO"
 		if on:
 			cal_t = 2.0)
-	var rc := _pbtn("◎", 0.21, 48)
+	var rc := _pbtn("CENTRER", 0.29, 84)
 	rc.pressed.connect(func(): cal_t = 2.0)
-	inv_btn = _pbtn("⇄", 0.28, 48)
+	inv_btn = _pbtn("INVERSER", 0.41, 90)
 	inv_btn.toggle_mode = true
 	pad_safe.add_child(shot_frame)
 	chat_panel = Panel.new()
@@ -1306,10 +1708,9 @@ func _build_pad_ui() -> void:
 	chat_panel.anchor_top = 0.17
 	chat_panel.anchor_bottom = 0.33
 	var csb := StyleBoxFlat.new()
-	csb.bg_color = Color(0.08, 0.1, 0.15, 0.95)
-	csb.border_color = Color("e8edf5")
-	csb.set_border_width_all(3)
-	csb.set_corner_radius_all(10)
+	csb.bg_color = Color(0.05, 0.07, 0.06, 0.96)
+	csb.border_color = C_ACC
+	csb.set_border_width_all(1)
 	chat_panel.add_theme_stylebox_override("panel", csb)
 	chat_panel.visible = false
 	var hb := HBoxContainer.new()
@@ -1330,15 +1731,16 @@ func _build_pad_ui() -> void:
 	csend.pressed.connect(func(): _chat_submit(chat_line))
 	hb.add_child(csend)
 	var cx := Button.new()
-	cx.text = "✕"
+	cx.text = "X"
 	cx.pressed.connect(func(): _chat_panel(false))
 	hb.add_child(cx)
 	chat_panel.add_child(hb)
 	pad_safe.add_child(chat_panel)
 	var cam_btn := _pbtn("", 0.86, 48)
-	cam_btn.icon = _cam_tex()
-	cam_btn.pressed.connect(func(): _request_shot(false))
-	var chat_btn := _pbtn("Chat", 0.95, 70)
+	cam_btn.icon = _icon("cam")
+	cam_btn.button_down.connect(_cam_down)
+	cam_btn.button_up.connect(_cam_up)
+	var chat_btn := _pbtn("CHAT", 0.95, 70)
 	chat_btn.pressed.connect(func(): _chat_panel(not chat_panel.visible))
 	pad_hint = Label.new()
 	pad_hint.anchor_left = 0.3
@@ -1352,6 +1754,7 @@ func _build_pad_ui() -> void:
 
 
 func _open_pad(on: bool) -> void:
+	_cam_up()
 	pad_ui.visible = on
 	pad_open = on
 	get_window().content_scale_size = Vector2i(800, 400) if on else Vector2i(440, 880)
@@ -1366,17 +1769,17 @@ func _open_pad(on: bool) -> void:
 
 
 func _set_status(t: String, s := "") -> void:
-	status.text = t
-	var col := Color("b7791f")  # attente
+	status.text = t.replace(" ✔", "").replace("✔", "").to_upper()
+	var col := C_ACC  # attente
 	if "✔" in t:
-		col = Color("1f9d55")
+		col = C_OK
 	else:
 		for k in ["impossible", "perdue", "Échec", "Refusé", "introuvable"]:
 			if k in t or k in s:
-				col = Color("c0392b")
-	sub.text = s if col == Color("c0392b") else ""
+				col = C_BAD
+	led.col = col
+	sub.text = s if col == C_BAD else ""
 	sub.visible = sub.text != ""
-	status_panel.add_theme_stylebox_override("panel", _sbox(col, 16, 16, 12))
 
 
 # ------------------------------------------------------------------ Protocole
@@ -1432,13 +1835,15 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 		var d = JSON.parse_string(pl.get_string_from_utf8())
 		if typeof(d) == TYPE_DICTIONARY and typeof(d.get("e")) == TYPE_ARRAY:
 			var es: Array = d["e"]
-			chat_status.text = ""
-			if es.is_empty():
+			var before := chat_hist.size()
+			_hist_merge(es)
+			var dropped := int(d.get("x", 0))
+			if es.is_empty() and chat_hist.is_empty():
 				chat_status.text = "Aucun texte lu"
 				_set_view(1)
 			else:
-				_chat_show_list(es)
-				_set_view(0)
+				chat_status.text = ("%d ligne(s) ignorée(s)" % dropped) if dropped > 0 else ("+%d" % (chat_hist.size() - before) if chat_hist.size() > before else "")
+				_chat_show_list(chat_hist)
 		return
 	if t == T_AIRES and is_phone:
 		var d2 = JSON.parse_string(pl.get_string_from_utf8())
@@ -1471,7 +1876,7 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 		_pc_chat(pl)
 		return
 	if t == T_CHATRES and is_phone and pl.size() >= 1:
-		var msg := "Envoyé ✔" if pl[0] == 1 else "Refusé : à autoriser sur le PC"
+		var msg := "Envoyé" if pl[0] == 1 else "Refusé : à autoriser sur le PC"
 		if chat_status != null:
 			chat_status.text = msg
 		if pad_hint != null:
@@ -1512,6 +1917,7 @@ func _process(delta: float) -> void:
 	bar.value = peak
 	if is_phone:
 		_drive_tick(delta)
+		_cam_tick()
 		_phone_process()
 	else:
 		_pc_process(delta)
@@ -1623,7 +2029,7 @@ func _hosts_tick() -> void:
 	for ip in hosts:
 		var b := Button.new()
 		b.custom_minimum_size = Vector2(0, 44)
-		b.text = ("✔ " if ip == cur else "") + "%s  (%s)" % [hosts[ip]["name"], ip]
+		b.text = ("[ON] " if ip == cur else "") + "%s  (%s)" % [str(hosts[ip]["name"]).to_upper(), ip]
 		b.pressed.connect(_connect_host.bind(ip))
 		host_box.add_child(b)
 
@@ -2218,7 +2624,9 @@ func _drive_tick(delta: float) -> void:
 		z.modulate = Color(1.6, 1.6, 1.6) if pr.has(z.name) else Color.WHITE
 	var sel := pr.has("Select")
 	if sel and not sel_prev:
-		_request_shot(false)
+		_cam_down()
+	elif sel_prev and not sel:
+		_cam_up()
 	sel_prev = sel
 	shot_frame.visible = Time.get_ticks_msec() < shot_until
 	var lx := lstick.v.x
@@ -2275,12 +2683,15 @@ func _chat_submit(le: LineEdit) -> void:
 	var b := PackedByteArray([1 if (chat_enter == null or chat_enter.button_pressed) else 0])
 	b.append_array(text.to_utf8_buffer())
 	_send(T_CHAT, b)
+	chat_hist.append({"n": "MOI", "m": text, "ts": int(Time.get_unix_time_from_system()), "b": hist_batch, "me": true})
+	_hist_save()
+	_chat_show_list(chat_hist)
 	le.clear()
 	if le == chat_line:
 		_chat_panel(false)
 
 
-func _request_shot(_show_prev: bool, keys := true, full := false) -> void:
+func _request_shot(_show_prev: bool, open := true, full := false, close := false) -> void:
 	shot_req_t = Time.get_ticks_msec()
 	var b := PackedByteArray()
 	if full:
@@ -2288,9 +2699,39 @@ func _request_shot(_show_prev: bool, keys := true, full := false) -> void:
 	else:
 		for i in 4:
 			b.append(int(shot_sl[i].value))
-		b.append((1 if (keys and chat_enter.button_pressed) else 0) | (2 if tr_in_check.button_pressed else 0))
-	chat_status.text = "Capture…"
+		var fl := 0
+		if close:
+			fl |= 4
+		elif open and chat_enter.button_pressed:
+			fl |= 1
+		if tr_in_check.button_pressed:
+			fl |= 2
+		b.append(fl)
+	if not close:
+		chat_status.text = "Capture…"
 	_send(T_SHOTREQ, b)
+
+
+## Icône de capture : un appui = une capture ; maintenu = captures répétées (chat en direct).
+func _cam_down() -> void:
+	hist_batch += 1
+	cam_held = true
+	cam_last = Time.get_ticks_msec()
+	_request_shot(true)
+
+
+func _cam_up() -> void:
+	if not cam_held:
+		return
+	cam_held = false
+	if chat_enter.button_pressed:
+		_request_shot(true, false, false, true)
+
+
+func _cam_tick() -> void:
+	if cam_held and Time.get_ticks_msec() - cam_last > int(cap_int_sl.value) * 1000:
+		cam_last = Time.get_ticks_msec()
+		_request_shot(true, false)
 
 
 ## Manette : UDP (seul le dernier état compte, pas de retard cumulé) ; TCP si tunnel adb.
@@ -2482,19 +2923,25 @@ func _grab(fx: float, fy: float, fw: float, fh: float) -> Image:
 
 
 func _pc_shot(pl: PackedByteArray) -> void:
+	var fl: int = pl[4] if pl.size() >= 5 else 0
+	if fl & 4:  # fermeture seule : Entrée, une fois la capture en cours terminée
+		while shot_busy:
+			await get_tree().process_frame
+		if chat_allow.button_pressed and _kb_start():
+			kb_io.store_line(JSON.stringify({"open": "", "text": "", "enter": true}))
+			kb_io.flush()
+		return
 	var now := Time.get_ticks_msec()
-	if now - shot_last_t < 700:
+	if now - shot_last_t < 700 or shot_busy:
 		return
 	shot_last_t = now
-	var keys := pl.size() >= 5 and (pl[4] & 1) != 0 and chat_allow.button_pressed and _kb_start()
-	if keys:  # ouvre le chat du jeu avec « ! », laisse le temps de s'afficher
+	shot_busy = true
+	if (fl & 1) != 0 and chat_allow.button_pressed and _kb_start():  # ouvre le chat avec « ! »
 		kb_io.store_line(JSON.stringify({"open": "!", "text": "", "enter": false}))
 		kb_io.flush()
 		await get_tree().create_timer(0.5).timeout
 	var im := _grab(pl[0] / 100.0, pl[1] / 100.0, pl[2] / 100.0, pl[3] / 100.0)
-	if keys and kb_io != null:  # referme le chat avec Entrée
-		kb_io.store_line(JSON.stringify({"open": "", "text": "", "enter": true}))
-		kb_io.flush()
+	shot_busy = false
 	if im == null:
 		if shot_info != null:
 			shot_info.text = "Capture impossible."
@@ -2514,11 +2961,10 @@ func _pc_shot(pl: PackedByteArray) -> void:
 		c.append_array(jpg.slice(pos, pos + n))
 		_send(T_SHOT, c)
 		pos += n
-	# lecture du texte (sauf capture de tout l'écran pour choisir la zone)
 	if not ocr_busy and not (pl[2] >= 100 and pl[3] >= 100):
 		ocr_busy = true
 		ocr_th = Thread.new()
-		ocr_th.start(_ocr_run.bind(im.duplicate(), pl.size() >= 5 and (pl[4] & 2) != 0))
+		ocr_th.start(_ocr_run.bind(im.duplicate(), (fl & 2) != 0))
 
 
 # ------------------------------------------------------------------ Chat intelligent (PC)
@@ -2534,32 +2980,55 @@ func _ocr_run(img: Image, tr: bool) -> void:
 	img.save_png(path)
 	var out: Array = []
 	OS.execute("tesseract", [path, "stdout", "-l", "fra+eng", "--psm", "6"], out, false)
-	call_deferred("_ocr_done", _parse_chat("".join(out)), tr)
+	var res := _parse_chat("".join(out))
+	call_deferred("_ocr_done", res["e"], tr, res["x"])
 
 
-func _parse_chat(text: String) -> Array:
+func _noisy(n: String, m: String) -> bool:
+	if m.length() < 2 or n.length() > 28:
+		return true
+	var txt := n + m
+	var good := 0
+	var letters := 0
+	for ch in txt:
+		var c := ch.unicode_at(0)
+		var is_letter := (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 0xC0 and c <= 0x24F)
+		if is_letter:
+			letters += 1
+		if is_letter or (c >= 48 and c <= 57) or c == 32 or ch in ".,;:!?'’\"-()…/+%*&":
+			good += 1
+	return good < txt.length() * 0.8 or letters < 3
+
+
+func _parse_chat(text: String) -> Dictionary:
 	var rx := RegEx.create_from_string("^\\s*(?:[\\[\\(<][^\\]\\)>]{1,24}[\\]\\)>]\\s*)?([^:\\n]{1,32}?)\\s*[:：]\\s*(.+)$")
 	var out: Array = []
+	var dropped := 0
 	for raw in text.split("\n"):
 		var line := raw.strip_edges()
 		if line.length() < 2:
 			continue
 		var m := rx.search(line)
 		if m:
-			out.append({"n": m.get_string(1).strip_edges(), "m": m.get_string(2).strip_edges()})
-		elif out.size() > 0:
+			var n := m.get_string(1).strip_edges()
+			var msg := m.get_string(2).strip_edges()
+			if _noisy(n, msg):
+				dropped += 1
+			else:
+				out.append({"n": n, "m": msg})
+		elif out.size() > 0 and not _noisy("a", line):
 			out[out.size() - 1]["m"] = str(out[out.size() - 1]["m"]) + " " + line
 		else:
-			out.append({"n": "", "m": line})
-	return out.slice(maxi(0, out.size() - 20))
+			dropped += 1
+	return {"e": out.slice(maxi(0, out.size() - 20)), "x": dropped}
 
 
-func _ocr_done(entries: Array, tr: bool) -> void:
+func _ocr_done(entries: Array, tr: bool, dropped := 0) -> void:
 	if ocr_th != null:
 		ocr_th.wait_to_finish()
 		ocr_th = null
 	ocr_busy = false
-	_send(T_CHATLIST, JSON.stringify({"e": entries}).to_utf8_buffer())
+	_send(T_CHATLIST, JSON.stringify({"e": entries, "x": dropped}).to_utf8_buffer())
 	if tr and not entries.is_empty():
 		_ai_translate_list(entries)
 
@@ -2640,7 +3109,7 @@ func _pc_ai(pl: PackedByteArray) -> void:
 				var tones := ["friendly", "serious and concise", "humorous", "military radio style"]
 				var tone: String = tones[clampi(int(d.get("tone", 0)), 0, tones.size() - 1)]
 				var sysr := "You are a player of Arma Reforger (military simulation game) answering in the game chat. Write ONE short sentence (120 characters max), tone: %s, no quotation marks, no name prefix, no emoji. You MUST write your answer in %s." % [tone, lang]
-				var userr := "Last chat messages:\n%s\n\nReply to %s who wrote: %s" % ["\n".join(PackedStringArray(d.get("ctx", []))), str(d.get("n", "")), text]
+				var userr := "Chat history (oldest first, with time; MOI = my own earlier messages):\n%s\n\nCurrent time: %s. Use the history for context. Reply to %s who wrote: %s" % ["\n".join(PackedStringArray(d.get("ctx", []))), str(d.get("now", "")), str(d.get("n", "")), text]
 				_ollama([{"role": "system", "content": sysr}, {"role": "user", "content": userr}], false, 120,
 					func(ok2: bool, out: String):
 						_send_json(T_AIRES, {"ok": ok2, "op": op, "text": _clean_reply(out) if ok2 else out})))
