@@ -6,8 +6,8 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 16  # versionCode de l'APK
-const APP_VERSION := "2.1.0"
+const VERSION := 17  # versionCode de l'APK
+const APP_VERSION := "2.1.1"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
@@ -238,6 +238,25 @@ func _switch_tex(on: bool) -> ImageTexture:
 			var c := track.lerp(Color.WHITE, clampf(0.5 - kd, 0.0, 1.0))
 			c.a = clampf(0.5 - d, 0.0, 1.0)
 			im.set_pixel(x, y, c)
+	return ImageTexture.create_from_image(im)
+
+
+func _cam_tex() -> ImageTexture:
+	var im := Image.create(40, 40, false, Image.FORMAT_RGBA8)
+	for y in 40:
+		for x in 40:
+			var p := Vector2(x + 0.5, y + 0.5)
+			# corps arrondi (4,13)-(36,34), bosse (14,8)-(26,13), objectif percé
+			var q := (p - Vector2(20, 23.5)).abs() - Vector2(16, 10.5) + Vector2(5, 5)
+			var body := (Vector2(maxf(q.x, 0.0), maxf(q.y, 0.0)).length() + minf(maxf(q.x, q.y), 0.0)) - 5.0
+			var bump := maxf(absf(p.x - 20.0) - 6.0, absf(p.y - 10.5) - 2.5)
+			var d := minf(body, bump)
+			var a := clampf(0.5 - d, 0.0, 1.0)
+			var lens := p.distance_to(Vector2(20, 24))
+			a *= 1.0 - clampf(0.5 - (absf(lens - 6.0) - 2.0), 0.0, 1.0) * 0.0
+			if lens < 8.0 and lens > 5.0:
+				a = 0.0
+			im.set_pixel(x, y, Color(1, 1, 1, a))
 	return ImageTexture.create_from_image(im)
 
 
@@ -573,6 +592,11 @@ func _build_screen_tab(parent: Node) -> void:
 		var row := HBoxContainer.new()
 		row.add_theme_constant_override("separation", 8)
 		p.add_child(row)
+		var cam := Button.new()
+		cam.icon = _cam_tex()
+		cam.custom_minimum_size = Vector2(48, 44)
+		cam.pressed.connect(func(): _request_shot(true))
+		row.add_child(cam)
 		chat_edit = LineEdit.new()
 		chat_edit.placeholder_text = "Message du chat"
 		chat_edit.max_length = 200
@@ -618,13 +642,9 @@ func _build_screen_tab(parent: Node) -> void:
 			hr.add_child(sl)
 			shot_sl.append(sl)
 		chat_enter = CheckButton.new()
-		chat_enter.text = "Entrée avant d'écrire"
+		chat_enter.text = "« ! » avant d'écrire"
 		chat_enter.button_pressed = true
 		box.add_child(chat_enter)
-		var tb := Button.new()
-		tb.text = "Tester la capture"
-		tb.pressed.connect(func(): _request_shot(true))
-		box.add_child(tb)
 	else:
 		shot_info = Label.new()
 		p.add_child(shot_info)
@@ -934,6 +954,9 @@ func _build_pad_ui() -> void:
 	hb.add_child(cx)
 	chat_panel.add_child(hb)
 	pad_safe.add_child(chat_panel)
+	var cam_btn := _pbtn("", 0.86, 48)
+	cam_btn.icon = _cam_tex()
+	cam_btn.pressed.connect(func(): _request_shot(false))
 	var chat_btn := _pbtn("Chat", 0.95, 70)
 	chat_btn.pressed.connect(func(): _chat_panel(not chat_panel.visible))
 	pad_hint = Label.new()
@@ -1954,9 +1977,9 @@ for line in sys.stdin:
         m = json.loads(line)
     except Exception:
         continue
-    if m.get('enter'):
-        tap(RET, [])
-        time.sleep(0.2)
+    for ch in m.get('open', ''):
+        type_char(ch)
+        time.sleep(0.25)
     for ch in m.get('text', ''):
         type_char(ch)
     time.sleep(0.05)
@@ -1996,7 +2019,7 @@ func _pc_chat(pl: PackedByteArray) -> void:
 	if text == "" or not _kb_start():
 		_send(T_CHATRES, PackedByteArray([0]))
 		return
-	kb_io.store_line(JSON.stringify({"enter": (pl[0] & 1) != 0, "text": text}))
+	kb_io.store_line(JSON.stringify({"open": "!" if (pl[0] & 1) != 0 else "", "text": text}))
 	kb_io.flush()
 	_send(T_CHATRES, PackedByteArray([1]))
 
