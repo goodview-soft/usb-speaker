@@ -6,8 +6,8 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 21  # versionCode de l'APK
-const APP_VERSION := "2.5.0"
+const VERSION := 22  # versionCode de l'APK
+const APP_VERSION := "2.6.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
@@ -24,6 +24,7 @@ const T_CHATLIST := 13  # PC -> téléphone : JSON {"e": [{"n": nom, "m": messag
 const T_AI := 14  # téléphone -> PC : JSON {"op": reply|translate|fix, ...}
 const T_AIRES := 15  # PC -> téléphone : JSON {"ok", "op", "text"}
 const T_VOICE := 16  # téléphone -> PC : voix 16 kHz mono s16 (début : langues)
+const T_AUTO := 18  # téléphone -> PC : [1 = conduite auto, 0 = stop] ; PC -> téléphone : [0] = arrêtée
 const T_VOICERES := 17  # PC -> téléphone : JSON {"ok", "text"}
 const LANGS := [["Sans traduction", "", ""], ["Anglais", "English", "en"], ["Espagnol", "Spanish", "es"],
 	["Allemand", "German", "de"], ["Italien", "Italian", "it"], ["Portugais", "Portuguese", "pt"],
@@ -104,6 +105,12 @@ var pad_pid := -1
 var pad_io: FileAccess
 var pad_err: FileAccess
 var pad_last := ""
+var auto_on := false
+var auto_pid := -1
+var auto_io: FileAccess
+var auto_th: Thread
+var auto_line := "0 0 0 0 0 0 0"
+var auto_btn: Button
 var drive_t := 0
 var drive_v := [0, 0, 0, 0, 0, 0, 0]
 var link_lbl: Label
@@ -165,6 +172,14 @@ var cam_held := false
 var cam_last := 0
 var cap_int_sl: HSlider
 var shot_busy := false
+var settings_panel: Control
+var ctx_list: HBoxContainer
+var ctx_zone: HBoxContainer
+var cal_pending := false
+var page_boxes: Array = []
+var nav_btns: Array = []
+var game_pages: Array = []
+var game_btns: Array = []
 var chat_scroll: ScrollContainer
 var chat_zoom := 1.0
 var zoom_lbl: Label
@@ -240,6 +255,11 @@ func _ready() -> void:
 		_phone_init()
 	else:
 		_pc_init()
+	if OS.get_environment("USBSPK_PARSETEST") == "1":
+		var txt := "[Global] Jean Dupont: salut tout le monde, quelqu'un a un helico ?\nGlobal: Enter message\nEnter\n[Groupe] Sniper42: on se retrouve a Everon nord dans 5 min vers le pont principal\nde la riviere pour la suite\nVasco: j'ai besoin de munitions 5.56 svp\n|~ ^^ #@ : §§ ¤¤ ~~~\nMike: ok je viens avec le camion\nEnter message to chat\nZ: x\n"
+		var r := _parse_chat(txt)
+		print("PARSE ", JSON.stringify(r))
+		get_tree().quit()
 	if is_phone and OS.get_environment("USBSPK_HISTTEST") == "1":
 		chat_hist = []
 		hist_batch = 1
@@ -290,6 +310,13 @@ const C_OK := Color("6fbf73")
 const C_BAD := Color("d0493f")
 const C_BG2 := C_PANEL
 const C_BG3 := C_LINE
+
+
+func _navbox(bg: Color, top: Color) -> StyleBoxFlat:
+	var sb := _sbox(bg, 0, 8, 12)
+	sb.border_color = top
+	sb.border_width_top = 3
+	return sb
 
 
 func _flat(bg: Color, border := Color(0, 0, 0, 0), bw := 0, ph := 12, pv := 8) -> StyleBoxFlat:
@@ -443,6 +470,15 @@ func _make_theme() -> Theme:
 	t.set_stylebox("pressed", "BtnChip", _flat(Color(C_ACC, 0.16), C_ACC, 1, 10, 5))
 	t.set_stylebox("hover_pressed", "BtnChip", _flat(Color(C_ACC, 0.16), C_ACC, 1, 10, 5))
 	t.set_font_size("font_size", "BtnChip", 13)
+	_variation(t, "BtnNav", "Button")
+	for st in ["normal", "disabled"]:
+		t.set_stylebox(st, "BtnNav", _navbox(C_PANEL, C_LINE))
+	for st in ["hover", "pressed", "hover_pressed"]:
+		t.set_stylebox(st, "BtnNav", _navbox(C_PANEL2, C_ACC))
+	t.set_font_size("font_size", "BtnNav", 16)
+	t.set_color("font_color", "BtnNav", C_DIM)
+	for c in ["font_hover_color", "font_pressed_color", "font_hover_pressed_color"]:
+		t.set_color(c, "BtnNav", C_ACC)
 	_variation(t, "BtnIcon", "Button")
 	for st in ["normal", "disabled"]:
 		t.set_stylebox(st, "BtnIcon", _flat(C_PANEL, C_LINE, 1, 0, 0))
@@ -676,8 +712,7 @@ func _build_ui() -> void:
 		pend_box = VBoxContainer.new()
 		pend_box.add_theme_constant_override("separation", 6)
 		v.add_child(pend_box)
-		_build_chat_page(v)
-		_build_menu()
+		_build_phone_pages(v)
 	else:
 		var sc := ScrollContainer.new()
 		sc.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -711,12 +746,7 @@ func _build_header(v: VBoxContainer) -> void:
 	status.clip_text = true
 	hb.add_child(status)
 	if is_phone:
-		menu_btn = Button.new()
-		menu_btn.theme_type_variation = "BtnIcon"
-		menu_btn.icon = _icon("menu")
-		menu_btn.custom_minimum_size = Vector2(46, 40)
-		menu_btn.pressed.connect(func(): menu_ui.visible = true)
-		hb.add_child(menu_btn)
+		pass
 	else:
 		var ver := Label.new()
 		ver.text = "ARMA REFORGER · V%s" % APP_VERSION
@@ -773,6 +803,92 @@ func _switch(parent: Node, text: String, on: bool) -> CheckButton:
 	return c
 
 
+# ---- Téléphone : 3 pages (CONNEXION, SON, JEU) + barre de navigation
+
+func _build_phone_pages(v: VBoxContainer) -> void:
+	var area := VBoxContainer.new()
+	area.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	v.add_child(area)
+	# CONNEXION
+	var sc0 := ScrollContainer.new()
+	sc0.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	sc0.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	sc0.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_NEVER
+	area.add_child(sc0)
+	var p0 := VBoxContainer.new()
+	p0.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	p0.add_theme_constant_override("separation", 18)
+	sc0.add_child(p0)
+	_sec_link(_section(p0, "LIAISON"))
+	_sec_system(_section(p0, "SYSTÈME"))
+	# SON
+	var sc1 := ScrollContainer.new()
+	sc1.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	sc1.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	sc1.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_NEVER
+	area.add_child(sc1)
+	var p1 := VBoxContainer.new()
+	p1.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sc1.add_child(p1)
+	_sec_sound(_section(p1, "SON"))
+	# JEU > ARMA REFORGER > CHAT / MANETTE
+	var p2 := VBoxContainer.new()
+	p2.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	p2.add_theme_constant_override("separation", 8)
+	area.add_child(p2)
+	var gh := HBoxContainer.new()
+	gh.add_theme_constant_override("separation", 6)
+	p2.add_child(gh)
+	var gt := Label.new()
+	gt.text = "ARMA REFORGER"
+	gt.theme_type_variation = "Section"
+	gt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gh.add_child(gt)
+	for i in 2:
+		var gb := _btn(["CHAT", "MANETTE"][i], "BtnChip")
+		gb.toggle_mode = true
+		gb.pressed.connect(_game_view.bind(i))
+		gh.add_child(gb)
+		game_btns.append(gb)
+	var gc := VBoxContainer.new()
+	gc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	p2.add_child(gc)
+	var chat_box := VBoxContainer.new()
+	chat_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	gc.add_child(chat_box)
+	_build_chat_page(chat_box)
+	var pad_box := VBoxContainer.new()
+	gc.add_child(pad_box)
+	_sec_pad(_section(pad_box, "MANETTE"))
+	game_pages = [chat_box, pad_box]
+	page_boxes = [sc0, sc1, p2]
+	# barre de navigation du bas
+	var nav := HBoxContainer.new()
+	nav.add_theme_constant_override("separation", 0)
+	v.add_child(nav)
+	for i in 3:
+		var nb := _btn(["CONNEXION", "SON", "JEU"][i], "BtnNav")
+		nb.toggle_mode = true
+		nb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		nb.pressed.connect(_nav.bind(i))
+		nav.add_child(nb)
+		nav_btns.append(nb)
+	_game_view(0)
+	_nav(2)
+
+
+func _nav(i: int) -> void:
+	for k in page_boxes.size():
+		page_boxes[k].visible = k == i
+		nav_btns[k].button_pressed = k == i
+
+
+func _game_view(i: int) -> void:
+	for k in game_pages.size():
+		game_pages[k].visible = k == i
+		game_btns[k].button_pressed = k == i
+
+
 # ---- Page principale du téléphone : l'outil de chat
 
 func _build_chat_page(v: VBoxContainer) -> void:
@@ -783,7 +899,7 @@ func _build_chat_page(v: VBoxContainer) -> void:
 	shot_prev = TextureRect.new()
 	shot_prev.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	shot_prev.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	# saisie en haut : visible quand le clavier s'ouvre
+	# saisie en haut : reste visible quand le clavier s'ouvre
 	var comp := PanelContainer.new()
 	comp.add_theme_stylebox_override("panel", _flat(C_PANEL, C_LINE, 1, 8, 8))
 	p.add_child(comp)
@@ -826,30 +942,33 @@ func _build_chat_page(v: VBoxContainer) -> void:
 	var trb := _btn("TRADUIRE", "BtnChip")
 	trb.pressed.connect(func(): _ai_text("translate"))
 	row2.add_child(trb)
-	# flux : entête
+	# vues : liste, image, zone, réglages
 	var fh := HBoxContainer.new()
-	fh.add_theme_constant_override("separation", 6)
+	fh.add_theme_constant_override("separation", 4)
 	p.add_child(fh)
-	var ft := Label.new()
-	ft.text = "MESSAGES"
-	ft.theme_type_variation = "Section"
-	ft.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	fh.add_child(ft)
-	undo_btn = _btn("ANNULER", "BtnChip")
-	undo_btn.pressed.connect(_hist_undo)
-	fh.add_child(undo_btn)
-	clear_btn = _btn("VIDER", "BtnChip")
-	clear_btn.pressed.connect(_hist_clear)
-	fh.add_child(clear_btn)
-	for i in 2:
-		var vb := _btn(["LISTE", "IMAGE"][i], "BtnChip")
+	for i in 4:
+		var vb := _btn(["MESSAGES", "IMAGE", "ZONE", "RÉGLAGES"][i], "BtnChip")
 		vb.toggle_mode = true
+		vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		vb.pressed.connect(_set_view.bind(i))
 		fh.add_child(vb)
 		view_btns.append(vb)
+	# actions de la vue courante
+	var ctx := HBoxContainer.new()
+	ctx.add_theme_constant_override("separation", 6)
+	p.add_child(ctx)
+	ctx_list = HBoxContainer.new()
+	ctx_list.add_theme_constant_override("separation", 6)
+	ctx.add_child(ctx_list)
+	undo_btn = _btn("ANNULER LA DERNIÈRE CAPTURE", "BtnChip")
+	undo_btn.pressed.connect(_hist_undo)
+	ctx_list.add_child(undo_btn)
+	clear_btn = _btn("VIDER", "BtnChip")
+	clear_btn.pressed.connect(_hist_clear)
+	ctx_list.add_child(clear_btn)
 	zoom_box = HBoxContainer.new()
 	zoom_box.add_theme_constant_override("separation", 4)
-	fh.add_child(zoom_box)
+	ctx.add_child(zoom_box)
 	var zo := _btn("−", "BtnChip")
 	zo.pressed.connect(func(): _chat_zoom(-1))
 	zoom_box.add_child(zo)
@@ -860,7 +979,18 @@ func _build_chat_page(v: VBoxContainer) -> void:
 	var zi := _btn("+", "BtnChip")
 	zi.pressed.connect(func(): _chat_zoom(1))
 	zoom_box.add_child(zi)
-	# flux : liste ou image, cadre à coins
+	ctx_zone = HBoxContainer.new()
+	ctx_zone.add_theme_constant_override("separation", 6)
+	ctx.add_child(ctx_zone)
+	var zh := Label.new()
+	zh.text = "DESSINE LE RECTANGLE DU CHAT"
+	zh.theme_type_variation = "Caps"
+	zh.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ctx_zone.add_child(zh)
+	var zr := _btn("ACTUALISER L'ÉCRAN", "BtnChip")
+	zr.pressed.connect(func(): _request_shot(true, false, true))
+	ctx_zone.add_child(zr)
+	# zone d'affichage (cadre à coins)
 	var feed := PanelContainer.new()
 	feed.add_theme_stylebox_override("panel", _flat(Color("080b0a"), C_LINE, 1, 0, 0))
 	feed.size_flags_vertical = Control.SIZE_EXPAND_FILL
@@ -896,6 +1026,21 @@ func _build_chat_page(v: VBoxContainer) -> void:
 	shot_prev.add_child(sel_box)
 	shot_prev.mouse_filter = Control.MOUSE_FILTER_STOP
 	shot_prev.gui_input.connect(_sel_input)
+	var ssc := ScrollContainer.new()
+	ssc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	ssc.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_NEVER
+	ssc.visible = false
+	feed.add_child(ssc)
+	settings_panel = ssc
+	var sm := MarginContainer.new()
+	for k in ["left", "right", "top", "bottom"]:
+		sm.add_theme_constant_override("margin_" + k, 12)
+	sm.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ssc.add_child(sm)
+	var sv := VBoxContainer.new()
+	sv.add_theme_constant_override("separation", 12)
+	sm.add_child(sv)
+	_build_settings_view(sv)
 	var hf := HudFrame.new()
 	hf.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	feed.add_child(hf)
@@ -916,54 +1061,79 @@ func _build_chat_page(v: VBoxContainer) -> void:
 	_chat_show_list(chat_hist)
 
 
+## Réglages du chat (vue RÉGLAGES). La zone (X, Y, largeur, hauteur) se dessine dans la vue ZONE.
+func _build_settings_view(sv: VBoxContainer) -> void:
+	var hold := Control.new()
+	hold.visible = false
+	add_child(hold)
+	for d in [[0, 90, 0], [0, 90, 0], [10, 100, 35], [5, 100, 30]]:
+		var sl := HSlider.new()
+		sl.min_value = d[0]
+		sl.max_value = d[1]
+		sl.value = d[2]
+		sl.step = 1
+		hold.add_child(sl)
+		shot_sl.append(sl)
+	var ih := HBoxContainer.new()
+	sv.add_child(ih)
+	var il := Label.new()
+	il.text = "INTERVALLE"
+	il.theme_type_variation = "Caps"
+	il.custom_minimum_size = Vector2(90, 0)
+	ih.add_child(il)
+	cap_int_sl = HSlider.new()
+	cap_int_sl.min_value = 1
+	cap_int_sl.max_value = 10
+	cap_int_sl.value = 3
+	cap_int_sl.step = 1
+	cap_int_sl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cap_int_sl.custom_minimum_size = Vector2(0, 28)
+	ih.add_child(cap_int_sl)
+	var dh := HBoxContainer.new()
+	sv.add_child(dh)
+	var dl := Label.new()
+	dl.text = "AFFICHAGE"
+	dl.theme_type_variation = "Caps"
+	dl.custom_minimum_size = Vector2(90, 0)
+	dh.add_child(dl)
+	var dsl := HSlider.new()
+	dsl.min_value = 2
+	dsl.max_value = 20
+	dsl.value = 6
+	dsl.step = 1
+	dsl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	dsl.custom_minimum_size = Vector2(0, 28)
+	dh.add_child(dsl)
+	shot_sl.append(dsl)
+	chat_enter = _switch(sv, "« ! » puis Entrée autour de la capture", true)
+	tr_in_check = _switch(sv, "Traduire les messages reçus en français", true)
+	var tr2 := HBoxContainer.new()
+	sv.add_child(tr2)
+	var tl2 := Label.new()
+	tl2.text = "DICTÉE"
+	tl2.theme_type_variation = "Caps"
+	tl2.custom_minimum_size = Vector2(90, 0)
+	tr2.add_child(tl2)
+	lang_in_opt = OptionButton.new()
+	for l in [LANGS[10]] + LANGS.slice(1, 10):
+		lang_in_opt.add_item(str(l[0]).to_upper())
+	lang_in_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tr2.add_child(lang_in_opt)
+	var tr3 := HBoxContainer.new()
+	sv.add_child(tr3)
+	var tl3 := Label.new()
+	tl3.text = "TON IA"
+	tl3.theme_type_variation = "Caps"
+	tl3.custom_minimum_size = Vector2(90, 0)
+	tr3.add_child(tl3)
+	tone_opt = OptionButton.new()
+	for t in ["Amical", "Sérieux", "Humoristique", "Militaire"]:
+		tone_opt.add_item(t.to_upper())
+	tone_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tr3.add_child(tone_opt)
+
+
 # ---- Menu (téléphone) : tout le reste
-
-func _build_menu() -> void:
-	menu_ui = Control.new()
-	menu_ui.set_anchors_preset(Control.PRESET_FULL_RECT)
-	menu_ui.visible = false
-	var bg := ColorRect.new()
-	bg.color = C_BG
-	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
-	menu_ui.add_child(bg)
-	menu_margin = MarginContainer.new()
-	menu_margin.set_anchors_preset(Control.PRESET_FULL_RECT)
-	menu_ui.add_child(menu_margin)
-	var v := VBoxContainer.new()
-	v.add_theme_constant_override("separation", 10)
-	menu_margin.add_child(v)
-	var hb := HBoxContainer.new()
-	v.add_child(hb)
-	var t := Label.new()
-	t.text = "MENU"
-	t.theme_type_variation = "Section"
-	t.add_theme_font_size_override("font_size", 17)
-	t.add_theme_color_override("font_color", C_TXT)
-	t.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb.add_child(t)
-	var cl := _btn("FERMER", "BtnChip")
-	cl.pressed.connect(func(): menu_ui.visible = false)
-	hb.add_child(cl)
-	var line := ColorRect.new()
-	line.color = Color(C_ACC, 0.7)
-	line.custom_minimum_size = Vector2(0, 1)
-	v.add_child(line)
-	var sc := ScrollContainer.new()
-	sc.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	sc.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_NEVER
-	v.add_child(sc)
-	var col := VBoxContainer.new()
-	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	col.add_theme_constant_override("separation", 18)
-	sc.add_child(col)
-	_sec_link(_section(col, "LIAISON"))
-	_sec_capture(_section(col, "CAPTURE DU CHAT"))
-	_sec_sound(_section(col, "SON"))
-	_sec_pad(_section(col, "MANETTE"))
-	_sec_system(_section(col, "SYSTÈME"))
-	add_child(menu_ui)
-
 
 func _sec_link(p: VBoxContainer) -> void:
 	link_lbl = Label.new()
@@ -1034,9 +1204,7 @@ func _sec_pad(p: VBoxContainer) -> void:
 		drive_info.visible = false
 		p.add_child(drive_info)
 		var ob := _btn("OUVRIR LA MANETTE", "BtnAccent")
-		ob.pressed.connect(func():
-			menu_ui.visible = false
-			_open_pad(true))
+		ob.pressed.connect(func(): _open_pad(true))
 		p.add_child(ob)
 		var vc := _switch(p, "Vibrations", true)
 		vc.toggled.connect(func(on): vib_on = on)
@@ -1048,70 +1216,6 @@ func _sec_pad(p: VBoxContainer) -> void:
 		wheel.custom_minimum_size = Vector2(0, 100)
 		p.add_child(wheel)
 		drive_check = _switch(p, "Manette virtuelle", true)
-
-
-func _sec_capture(p: VBoxContainer) -> void:
-	for d in [["X", 0, 90, 0], ["Y", 0, 90, 0], ["LARG.", 10, 100, 35], ["HAUT.", 5, 100, 30], ["DURÉE", 2, 20, 6]]:
-		var hr := HBoxContainer.new()
-		p.add_child(hr)
-		var l := Label.new()
-		l.text = d[0]
-		l.theme_type_variation = "Caps"
-		l.custom_minimum_size = Vector2(60, 0)
-		hr.add_child(l)
-		var sl := HSlider.new()
-		sl.min_value = d[1]
-		sl.max_value = d[2]
-		sl.value = d[3]
-		sl.step = 1
-		sl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		sl.custom_minimum_size = Vector2(0, 28)
-		hr.add_child(sl)
-		shot_sl.append(sl)
-	var ih := HBoxContainer.new()
-	p.add_child(ih)
-	var il := Label.new()
-	il.text = "INTERVALLE"
-	il.theme_type_variation = "Caps"
-	il.custom_minimum_size = Vector2(60, 0)
-	ih.add_child(il)
-	cap_int_sl = HSlider.new()
-	cap_int_sl.min_value = 1
-	cap_int_sl.max_value = 10
-	cap_int_sl.value = 3
-	cap_int_sl.step = 1
-	cap_int_sl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	cap_int_sl.custom_minimum_size = Vector2(0, 28)
-	ih.add_child(cap_int_sl)
-	sel_tg = _btn("CHOISIR LA ZONE SUR L'ÉCRAN DU PC", "BtnChip")
-	sel_tg.pressed.connect(_sel_start)
-	p.add_child(sel_tg)
-	chat_enter = _switch(p, "« ! » puis Entrée autour de la capture", true)
-	tr_in_check = _switch(p, "Traduire les messages reçus en français", true)
-	var tr2 := HBoxContainer.new()
-	p.add_child(tr2)
-	var tl2 := Label.new()
-	tl2.text = "DICTÉE"
-	tl2.theme_type_variation = "Caps"
-	tl2.custom_minimum_size = Vector2(80, 0)
-	tr2.add_child(tl2)
-	lang_in_opt = OptionButton.new()
-	for l in [LANGS[10]] + LANGS.slice(1, 10):
-		lang_in_opt.add_item(str(l[0]).to_upper())
-	lang_in_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	tr2.add_child(lang_in_opt)
-	var tr3 := HBoxContainer.new()
-	p.add_child(tr3)
-	var tl3 := Label.new()
-	tl3.text = "TON IA"
-	tl3.theme_type_variation = "Caps"
-	tl3.custom_minimum_size = Vector2(80, 0)
-	tr3.add_child(tl3)
-	tone_opt = OptionButton.new()
-	for t in ["Amical", "Sérieux", "Humoristique", "Militaire"]:
-		tone_opt.add_item(t.to_upper())
-	tone_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	tr3.add_child(tone_opt)
 
 
 func _sec_chat_pc(p: VBoxContainer) -> void:
@@ -1221,12 +1325,19 @@ func _pbtn(txt: String, cx: float, w: float) -> Button:
 
 func _set_view(v: int) -> void:
 	list_panel.visible = v == 0
-	viewer_panel.visible = v == 1
+	viewer_panel.visible = v == 1 or v == 2
+	settings_panel.visible = v == 3
+	ctx_list.visible = v == 0
 	zoom_box.visible = v == 1
-	undo_btn.visible = v == 0
-	clear_btn.visible = v == 0
+	ctx_zone.visible = v == 2
+	selecting = v == 2
+	var sm := ScrollContainer.SCROLL_MODE_DISABLED if v == 2 else ScrollContainer.SCROLL_MODE_AUTO
+	chat_scroll.vertical_scroll_mode = sm
+	chat_scroll.horizontal_scroll_mode = sm
 	for i in view_btns.size():
 		view_btns[i].button_pressed = i == v
+	if v == 2:
+		_zone_enter()
 
 
 func _chat_show_list(entries: Array) -> void:
@@ -1492,17 +1603,19 @@ func _chat_zoom_apply() -> void:
 
 
 ## Choix de la zone : le PC envoie tout l'écran, on dessine un rectangle dessus.
-func _sel_start() -> void:
-	menu_ui.visible = false
-	_set_view(1)
+func _zone_show_current() -> void:
+	if sel_box == null:
+		return
+	sel_box.r = Rect2(shot_sl[0].value / 100.0, shot_sl[1].value / 100.0, shot_sl[2].value / 100.0, shot_sl[3].value / 100.0)
+	sel_box.active = true
+	sel_box.queue_redraw()
+
+
+func _zone_enter() -> void:
 	chat_zoom = 1.0
 	zoom_lbl.text = "×1"
-	selecting = true
-	sel_box.active = false
-	sel_box.queue_redraw()
-	chat_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	chat_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	chat_status.text = "Dessine la zone"
+	_zone_show_current()
+	chat_status.text = "Dessine la zone du chat"
 	_request_shot(true, false, true)
 
 
@@ -1519,19 +1632,16 @@ func _sel_input(ev: InputEvent) -> void:
 			sel_box.active = true
 		elif sel_box.active:
 			var r := sel_box.r
-			sel_box.active = false
-			sel_box.queue_redraw()
 			if r.size.x > 0.03 and r.size.y > 0.03:
 				shot_sl[0].value = r.position.x * 100.0
 				shot_sl[1].value = r.position.y * 100.0
 				shot_sl[2].value = r.size.x * 100.0
 				shot_sl[3].value = r.size.y * 100.0
-				selecting = false
-				chat_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
-				chat_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
-				chat_status.text = "Zone enregistrée"
-				_request_shot(true, false)
-	elif ev is InputEventMouseMotion and sel_box.active:
+				cal_pending = true
+				chat_status.text = "Zone enregistrée, test…"
+				_request_shot(true, false, false, false, true)
+			_zone_show_current()
+	elif ev is InputEventMouseMotion and sel_box.active and ev.button_mask != 0:
 		var b: Vector2 = (ev.position / sz).clamp(Vector2.ZERO, Vector2.ONE)
 		sel_box.r = Rect2(sel_a, b - sel_a).abs()
 		sel_box.queue_redraw()
@@ -1697,6 +1807,11 @@ func _build_pad_ui() -> void:
 		gyro_btn.text = "GYRO ON" if on else "GYRO"
 		if on:
 			cal_t = 2.0)
+	auto_btn = _pbtn("AUTO", 0.52, 66)
+	auto_btn.toggle_mode = true
+	auto_btn.toggled.connect(func(on):
+		auto_btn.text = "AUTO ON" if on else "AUTO"
+		_send(T_AUTO, PackedByteArray([1 if on else 0])))
 	var rc := _pbtn("CENTRER", 0.29, 84)
 	rc.pressed.connect(func(): cal_t = 2.0)
 	inv_btn = _pbtn("INVERSER", 0.41, 90)
@@ -1835,6 +1950,10 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 		var d = JSON.parse_string(pl.get_string_from_utf8())
 		if typeof(d) == TYPE_DICTIONARY and typeof(d.get("e")) == TYPE_ARRAY:
 			var es: Array = d["e"]
+			if cal_pending:
+				cal_pending = false
+				chat_status.text = "%d message(s) lu(s) dans la zone" % es.size() + (" · %d ignoré(s)" % int(d.get("x", 0)) if int(d.get("x", 0)) > 0 else "")
+				return
 			var before := chat_hist.size()
 			_hist_merge(es)
 			var dropped := int(d.get("x", 0))
@@ -1871,6 +1990,16 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 		return
 	if t == T_SHOTREQ and not is_phone and pl.size() >= 4:
 		_pc_shot(pl)
+		return
+	if t == T_AUTO and pl.size() >= 1:
+		if is_phone:
+			if auto_btn != null and pl[0] == 0:
+				auto_btn.set_pressed_no_signal(false)
+				auto_btn.text = "AUTO"
+		elif pl[0] == 1:
+			_auto_start()
+		else:
+			_auto_stop()
 		return
 	if t == T_CHAT and not is_phone and pl.size() >= 2:
 		_pc_chat(pl)
@@ -2449,6 +2578,9 @@ func _pc_shutdown() -> void:
 	if stt_pid > 0:
 		OS.kill(stt_pid)
 		stt_pid = -1
+	_auto_stop()
+	if auto_th != null:
+		auto_th.wait_to_finish()
 	if stt_th != null:
 		stt_th.wait_to_finish()
 		stt_th = null
@@ -2691,7 +2823,7 @@ func _chat_submit(le: LineEdit) -> void:
 		_chat_panel(false)
 
 
-func _request_shot(_show_prev: bool, open := true, full := false, close := false) -> void:
+func _request_shot(_show_prev: bool, open := true, full := false, close := false, notr := false) -> void:
 	shot_req_t = Time.get_ticks_msec()
 	var b := PackedByteArray()
 	if full:
@@ -2704,7 +2836,7 @@ func _request_shot(_show_prev: bool, open := true, full := false, close := false
 			fl |= 4
 		elif open and chat_enter.button_pressed:
 			fl |= 1
-		if tr_in_check.button_pressed:
+		if tr_in_check.button_pressed and not notr:
 			fl |= 2
 		b.append(fl)
 	if not close:
@@ -3000,24 +3132,36 @@ func _noisy(n: String, m: String) -> bool:
 	return good < txt.length() * 0.8 or letters < 3
 
 
+const UI_WORDS := ["global", "enter", "channel", "canal", "groupe", "group", "direct", "side", "command", "commandement", "vehicle", "véhicule"]
+
+
+func _ui_text(t: String) -> bool:
+	var low := t.to_lower().strip_edges()
+	for w in UI_WORDS:
+		if low == w or low.begins_with(w + " ") or low.begins_with("[" + w):
+			return true
+	return false
+
+
 func _parse_chat(text: String) -> Dictionary:
-	var rx := RegEx.create_from_string("^\\s*(?:[\\[\\(<][^\\]\\)>]{1,24}[\\]\\)>]\\s*)?([^:\\n]{1,32}?)\\s*[:：]\\s*(.+)$")
+	var rx := RegEx.create_from_string("^\\s*(?:[\\[\\(<][^\\]\\)>]{1,24}[\\]\\)>]\\s*)?([^:\\n]{2,28}?)\\s*[:：]\\s*(.+)$")
 	var out: Array = []
 	var dropped := 0
 	for raw in text.split("\n"):
 		var line := raw.strip_edges()
-		if line.length() < 2:
+		if line.length() < 3:
 			continue
 		var m := rx.search(line)
 		if m:
 			var n := m.get_string(1).strip_edges()
 			var msg := m.get_string(2).strip_edges()
-			if _noisy(n, msg):
+			if _noisy(n, msg) or _ui_text(n) or _ui_text(msg):
 				dropped += 1
 			else:
 				out.append({"n": n, "m": msg})
-		elif out.size() > 0 and not _noisy("a", line):
-			out[out.size() - 1]["m"] = str(out[out.size() - 1]["m"]) + " " + line
+		elif out.size() > 0 and str(out[out.size() - 1]["m"]).length() >= 35 and line.split(" ").size() >= 2 \
+				and not _noisy("a", line) and not _ui_text(line):
+			out[out.size() - 1]["m"] = str(out[out.size() - 1]["m"]) + " " + line  # ligne de suite d'un long message
 		else:
 			dropped += 1
 	return {"e": out.slice(maxi(0, out.size() - 20)), "x": dropped}
@@ -3282,6 +3426,9 @@ func _stt_line(l: String) -> void:
 func _apply_drive(pl: PackedByteArray) -> void:
 	drive_v = [pl.decode_s16(0), pl.decode_s16(2), pl.decode_s16(4), pl.decode_s16(6), pl[8], pl[9], pl.decode_u16(10)]
 	drive_t = Time.get_ticks_msec()
+	if auto_on and (absi(drive_v[1]) > 6000 or absi(drive_v[2]) > 6000 or absi(drive_v[3]) > 6000 or drive_v[4] > 20 or drive_v[5] > 20 or drive_v[6] != 0):
+		_auto_stop()
+		_send(T_AUTO, PackedByteArray([0]))
 	wheel.steer = drive_v[0] / 32767.0
 	if drive_check.button_pressed:
 		_pad_start()
@@ -3329,10 +3476,18 @@ func _pad_tick() -> void:
 		pad_io = null
 		return
 	var v: Array = drive_v
-	if Time.get_ticks_msec() - drive_t > 500:
+	if Time.get_ticks_msec() - drive_t > (1500 if auto_on else 500):
 		v = [0, 0, 0, 0, 0, 0, 0]
 		wheel.steer = 0.0
+		if auto_on:
+			_auto_stop()
 	var line := "%d %d %d %d %d %d %d" % v
+	if auto_on and not OS.is_process_running(auto_pid):
+		drive_info.text = "Conduite auto : python3-opencv / numpy / ffmpeg requis"
+		_auto_stop()
+	if auto_on:
+		line = auto_line
+		wheel.steer = int(line.get_slice(" ", 0)) / 32767.0
 	if line != pad_last:
 		pad_last = line
 		pad_io.store_line(line)
@@ -3346,7 +3501,126 @@ func _kb_stop() -> void:
 	kb_io = null
 
 
+
+## Conduite auto : capture réduite + OpenCV (route = couleur devant le véhicule) -> volant + gaz plafonnés.
+const AUTO_PY := """import subprocess, sys, os
+import numpy as np, cv2
+W, H = 160, 90
+sw, sh = sys.argv[1], sys.argv[2]
+disp = sys.argv[3] if len(sys.argv) > 3 else ':0'
+MAXV = 0.5
+cmd = ['ffmpeg', '-v', 'quiet', '-f', 'x11grab', '-framerate', '30', '-video_size', sw + 'x' + sh, '-i', disp,
+       '-vf', 'scale=%d:%d' % (W, H), '-pix_fmt', 'bgr24', '-f', 'rawvideo', '-']
+p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+n = W * H * 3
+ROWS = [(0.50, 1.0), (0.56, 0.9), (0.62, 0.8), (0.68, 0.6), (0.74, 0.4)]
+s = 0.0
+def run(row, c):
+    if not row[c]:
+        lo = max(0, c - W // 4)
+        hi = min(W, c + W // 4)
+        idx = np.where(row[lo:hi])[0]
+        if len(idx) == 0:
+            return None
+        c = lo + int(idx[np.argmin(np.abs(idx + lo - c))])
+    l = c
+    gap = 0
+    while l > 0 and gap < 3:
+        l -= 1
+        gap = 0 if row[l] else gap + 1
+    r = c
+    gap = 0
+    while r < W - 1 and gap < 3:
+        r += 1
+        gap = 0 if row[r] else gap + 1
+    return (l + r) / 2.0, r - l
+try:
+    while True:
+        buf = p.stdout.read(n)
+        if len(buf) < n:
+            break
+        img = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        ref = np.median(lab[int(H * 0.62):int(H * 0.72), int(W * 0.44):int(W * 0.56)].reshape(-1, 3), axis=0)
+        d = lab - ref
+        dist = np.sqrt(0.4 * d[:, :, 0] ** 2 + d[:, :, 1] ** 2 + d[:, :, 2] ** 2)
+        mask = cv2.medianBlur(((dist < 18) * 255).astype(np.uint8), 5) > 0
+        tot = 0.0
+        wt = 0.0
+        ok = 0
+        for fy, w in ROWS:
+            res = run(mask[int(H * fy)], W // 2)
+            if res is None or res[1] < 10:
+                continue
+            tot += w * (res[0] - W / 2.0) / (W / 2.0)
+            wt += w
+            ok += 1
+        if ok < 2:
+            s *= 0.8
+            lt, rt = 150, 0
+        else:
+            s = 0.6 * s + 0.4 * max(-1.0, min(1.0, 1.8 * tot / wt))
+            lt = 0
+            rt = int(255 * MAXV * (1 - 0.6 * min(1.0, abs(s) * 1.5)))
+        sys.stdout.write('%d 0 0 0 %d %d 0\n' % (int(s * 32767), lt, rt))
+        sys.stdout.flush()
+finally:
+    p.kill()
+"""
+
+
+func _auto_start() -> void:
+	if auto_on:
+		return
+	_pad_start()
+	var path := OS.get_user_data_dir() + "/usbspk_auto.py"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_string(AUTO_PY)
+	f.close()
+	var sz := DisplayServer.screen_get_size(DisplayServer.get_primary_screen())
+	var disp := OS.get_environment("DISPLAY")
+	var io := OS.execute_with_pipe("python3", [path, str(sz.x), str(sz.y), disp if disp != "" else ":0"], false)
+	if not io.has("pid"):
+		_send(T_AUTO, PackedByteArray([0]))
+		return
+	auto_pid = io["pid"]
+	auto_io = io["stdio"]
+	auto_line = "0 0 0 0 0 0 0"
+	auto_on = true
+	if auto_th != null:
+		auto_th.wait_to_finish()
+	auto_th = Thread.new()
+	auto_th.start(_auto_loop)
+	drive_info.text = "Conduite auto active"
+
+
+func _auto_loop() -> void:
+	while auto_pid > 0 and not quit:
+		var l := auto_io.get_line()
+		if l == "":
+			if not OS.is_process_running(auto_pid):
+				break
+			OS.delay_msec(5)
+			continue
+		auto_line = l
+
+
+func _auto_stop() -> void:
+	if not auto_on and auto_pid <= 0:
+		return
+	auto_on = false
+	if auto_pid > 0:
+		OS.kill(auto_pid)
+	auto_pid = -1
+	auto_line = "0 0 0 0 0 0 0"
+	if linked and peer != null:
+		_send(T_AUTO, PackedByteArray([0]))
+
+
 func _pad_stop() -> void:
+	_auto_stop()
 	_kb_stop()
 	if pad_pid > 0:
 		OS.kill(pad_pid)
