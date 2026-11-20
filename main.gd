@@ -6,8 +6,8 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 12  # versionCode de l'APK
-const APP_VERSION := "1.9.0"
+const VERSION := 13  # versionCode de l'APK
+const APP_VERSION := "1.9.1"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
@@ -132,6 +132,11 @@ var shot_last_t := 0
 var shot_sl: Array = []
 var shot_info: Label
 var sel_prev := false
+var upd_status: Label
+var auto_upd: CheckButton
+var manual_check := false
+var upd_timer := 1800.0
+var auto_tried := false
 var drive_check: CheckButton
 var sound_check: CheckButton
 var phone_sound := true
@@ -463,6 +468,29 @@ func _build_net_tab() -> void:
 			link_mode = i
 			_reconnect())
 		p.add_child(link_opt)
+	var vl := Label.new()
+	vl.text = "Version %s" % APP_VERSION
+	vl.modulate = Color(1, 1, 1, 0.6)
+	p.add_child(vl)
+	upd_status = Label.new()
+	upd_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	p.add_child(upd_status)
+	var ub := Button.new()
+	ub.text = "Vérifier les mises à jour"
+	ub.custom_minimum_size = Vector2(0, 52)
+	ub.pressed.connect(func(): _check_update(true))
+	p.add_child(ub)
+	if not is_phone:
+		auto_upd = CheckButton.new()
+		auto_upd.text = "Mettre à jour automatiquement"
+		var cf2 := ConfigFile.new()
+		auto_upd.button_pressed = not (cf2.load("user://pref.cfg") == OK and not bool(cf2.get_value("pc", "auto_update", true)))
+		auto_upd.toggled.connect(func(on):
+			var c := ConfigFile.new()
+			c.load("user://pref.cfg")
+			c.set_value("pc", "auto_update", on)
+			c.save("user://pref.cfg"))
+		p.add_child(auto_upd)
 	var rb := Button.new()
 	rb.text = "Reconnecter"
 	rb.custom_minimum_size = Vector2(0, 52)
@@ -747,6 +775,10 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 
 
 func _process(delta: float) -> void:
+	upd_timer -= delta
+	if upd_timer <= 0.0:
+		upd_timer = 1800.0
+		_check_update()
 	peak = move_toward(peak, 0.0, delta * 1.5)
 	bar.value = peak
 	if is_phone:
@@ -1289,10 +1321,16 @@ func _pc_shutdown() -> void:
 
 # ------------------------------------------------------------------ Mise à jour (GitHub releases)
 
-func _check_update() -> void:
-	http = HTTPRequest.new()
-	add_child(http)
-	http.request_completed.connect(_on_release)
+func _check_update(manual := false) -> void:
+	if http == null:
+		http = HTTPRequest.new()
+		add_child(http)
+		http.request_completed.connect(_on_release)
+	if http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+		return
+	manual_check = manual
+	if manual and upd_status != null:
+		upd_status.text = "Vérification…"
 	http.request("https://api.github.com/repos/%s/releases/latest" % REPO, ["User-Agent: usb-speaker"])
 
 
@@ -1308,13 +1346,15 @@ func _newer(a: String, b: String) -> bool:
 
 
 func _on_release(result: int, code: int, _h: PackedStringArray, body: PackedByteArray) -> void:
-	if result != HTTPRequest.RESULT_SUCCESS or code != 200:
-		return
-	var d = JSON.parse_string(body.get_string_from_utf8())
+	var d = JSON.parse_string(body.get_string_from_utf8()) if result == HTTPRequest.RESULT_SUCCESS and code == 200 else null
 	if typeof(d) != TYPE_DICTIONARY:
+		if upd_status != null and manual_check:
+			upd_status.text = "Impossible de vérifier (pas d'internet ?)."
 		return
 	new_tag = str(d.get("tag_name", "")).trim_prefix("v")
 	if new_tag == "" or not _newer(new_tag, APP_VERSION):
+		if upd_status != null:
+			upd_status.text = "À jour (version %s)." % APP_VERSION
 		return
 	for a in d.get("assets", []):
 		if a["name"] == "usb-speaker.apk":
@@ -1324,9 +1364,15 @@ func _on_release(result: int, code: int, _h: PackedStringArray, body: PackedByte
 	if is_phone and url_apk != "":
 		upd_btn.text = "Mise à jour %s disponible : télécharger" % new_tag
 		upd_btn.visible = true
+		upd_status.text = "Mise à jour %s disponible (tu as la %s). Appuie sur le bouton en haut pour la télécharger." % [new_tag, APP_VERSION]
 	elif not is_phone and url_zip != "" and OS.get_executable_path().ends_with(".x86_64"):
 		upd_btn.text = "Mettre à jour vers %s" % new_tag
 		upd_btn.visible = true
+		upd_status.text = "Mise à jour %s disponible (tu as la %s)." % [new_tag, APP_VERSION]
+		if auto_upd.button_pressed and not linked and not auto_tried:
+			auto_tried = true
+			upd_status.text = "Mise à jour %s : installation automatique…" % new_tag
+			_do_update()
 
 
 func _do_update() -> void:
