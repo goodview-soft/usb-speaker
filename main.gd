@@ -6,8 +6,8 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 18  # versionCode de l'APK
-const APP_VERSION := "2.2.0"
+const VERSION := 19  # versionCode de l'APK
+const APP_VERSION := "2.3.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
@@ -20,6 +20,15 @@ const T_SHOT := 9  # PC -> téléphone : capture JPEG [flags: 1=début 2=fin] + 
 const T_SHOTREQ := 10  # téléphone -> PC : [x%, y%, largeur%, hauteur%]
 const T_CHAT := 11  # téléphone -> PC : [flags: 1 = Entrée avant] + texte utf8
 const T_CHATRES := 12  # PC -> téléphone : [1 = ok, 0 = refusé]
+const T_CHATLIST := 13  # PC -> téléphone : JSON {"e": [{"n": nom, "m": message, "t": traduction}]}
+const T_AI := 14  # téléphone -> PC : JSON {"op": reply|translate|fix, ...}
+const T_AIRES := 15  # PC -> téléphone : JSON {"ok", "op", "text"}
+const T_VOICE := 16  # téléphone -> PC : voix 16 kHz mono s16 (début : langues)
+const T_VOICERES := 17  # PC -> téléphone : JSON {"ok", "text"}
+const LANGS := [["Sans traduction", "", ""], ["Anglais", "English", "en"], ["Espagnol", "Spanish", "es"],
+	["Allemand", "German", "de"], ["Italien", "Italian", "it"], ["Portugais", "Portuguese", "pt"],
+	["Russe", "Russian", "ru"], ["Polonais", "Polish", "pl"], ["Ukrainien", "Ukrainian", "uk"],
+	["Néerlandais", "Dutch", "nl"], ["Français", "French", "fr"]]
 const T_PING := 7  # aller-retour (latence) : u32 ms
 const T_PONG := 8
 const T_NAME := 4  # PC -> téléphone : nom du PC (utf8)
@@ -146,6 +155,30 @@ var sel_box: SelBox
 var selecting := false
 var sel_a := Vector2.ZERO
 var sel_tg: Button
+var lang_out_opt: OptionButton
+var lang_in_opt: OptionButton
+var tone_opt: OptionButton
+var tr_in_check: CheckButton
+var mic_btn: Button
+var viewer_panel: PanelContainer
+var list_panel: PanelContainer
+var chat_list: VBoxContainer
+var zoom_box: HBoxContainer
+var view_btns: Array = []
+var chat_entries: Array = []
+var dict_on := false
+var dict_buf := PackedFloat32Array()
+var dict_t := 0
+var ocr_th: Thread
+var ocr_busy := false
+var ai_model := ""
+var ai_opt: OptionButton
+var stt_pid := -1
+var stt_io: FileAccess
+var stt_th: Thread
+var voice_buf := PackedByteArray()
+var voice_lang := "fr"
+var voice_out := ""
 var margin: MarginContainer
 var status_panel: PanelContainer
 var pad_safe: Control
@@ -264,6 +297,22 @@ func _cam_tex() -> ImageTexture:
 			if lens < 8.0 and lens > 5.0:
 				a = 0.0
 			im.set_pixel(x, y, Color(1, 1, 1, a))
+	return ImageTexture.create_from_image(im)
+
+
+func _mic_tex() -> ImageTexture:
+	var im := Image.create(40, 40, false, Image.FORMAT_RGBA8)
+	for y in 40:
+		for x in 40:
+			var p := Vector2(x + 0.5, y + 0.5)
+			var cap_d := p.distance_to(Vector2(20.0, clampf(p.y, 12.0, 18.0))) - 6.0
+			var arc := 1e9
+			if p.y >= 18.0:
+				arc = absf(p.distance_to(Vector2(20.0, 18.0)) - 11.0) - 1.4
+			var stem := maxf(absf(p.x - 20.0) - 1.4, absf(p.y - 32.5) - 3.5)
+			var base := maxf(absf(p.x - 20.0) - 6.0, absf(p.y - 36.0) - 1.4)
+			var dd := minf(minf(cap_d, arc), minf(stem, base))
+			im.set_pixel(x, y, Color(1, 1, 1, clampf(0.5 - dd, 0.0, 1.0)))
 	return ImageTexture.create_from_image(im)
 
 
@@ -607,57 +656,15 @@ func _build_screen_tab(parent: Node) -> void:
 	shot_prev.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	shot_prev.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	if is_phone:
-		var vw := PanelContainer.new()
-		vw.add_theme_stylebox_override("panel", _sbox(Color("07090d"), 10, 4, 4, C_BG3, 2))
-		vw.size_flags_vertical = Control.SIZE_EXPAND_FILL
-		p.add_child(vw)
-		chat_scroll = ScrollContainer.new()
-		chat_scroll.resized.connect(_chat_zoom_apply)
-		vw.add_child(chat_scroll)
-		chat_scroll.add_child(shot_prev)
-		sel_box = SelBox.new()
-		sel_box.set_anchors_preset(Control.PRESET_FULL_RECT)
-		sel_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		shot_prev.add_child(sel_box)
-		shot_prev.mouse_filter = Control.MOUSE_FILTER_STOP
-		shot_prev.gui_input.connect(_sel_input)
-		var tb := HBoxContainer.new()
-		tb.add_theme_constant_override("separation", 8)
-		p.add_child(tb)
-		var zo := Button.new()
-		zo.text = "−"
-		zo.custom_minimum_size = Vector2(44, 40)
-		zo.pressed.connect(func(): _chat_zoom(-1))
-		tb.add_child(zo)
-		zoom_lbl = Label.new()
-		zoom_lbl.text = "×1"
-		zoom_lbl.custom_minimum_size = Vector2(44, 0)
-		zoom_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		tb.add_child(zoom_lbl)
-		var zi := Button.new()
-		zi.text = "+"
-		zi.custom_minimum_size = Vector2(44, 40)
-		zi.pressed.connect(func(): _chat_zoom(1))
-		tb.add_child(zi)
-		var sp := Control.new()
-		sp.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		tb.add_child(sp)
-		chat_status = Label.new()
-		chat_status.add_theme_font_size_override("font_size", 13)
-		chat_status.modulate = Color(1, 1, 1, 0.7)
-		tb.add_child(chat_status)
-		var gear := Button.new()
-		gear.text = "⚙"
-		gear.custom_minimum_size = Vector2(44, 40)
-		tb.add_child(gear)
+		# 1) saisie en haut (reste visible quand le clavier s'ouvre)
 		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 8)
+		row.add_theme_constant_override("separation", 6)
 		p.add_child(row)
-		var cam := Button.new()
-		cam.icon = _cam_tex()
-		cam.custom_minimum_size = Vector2(48, 44)
-		cam.pressed.connect(func(): _request_shot(true))
-		row.add_child(cam)
+		mic_btn = Button.new()
+		mic_btn.icon = _mic_tex()
+		mic_btn.custom_minimum_size = Vector2(48, 44)
+		mic_btn.pressed.connect(_dict_toggle)
+		row.add_child(mic_btn)
 		chat_edit = LineEdit.new()
 		chat_edit.placeholder_text = "Message du chat"
 		chat_edit.max_length = 200
@@ -670,6 +677,95 @@ func _build_screen_tab(parent: Node) -> void:
 		cb.custom_minimum_size = Vector2(0, 44)
 		cb.pressed.connect(func(): _chat_submit(chat_edit))
 		row.add_child(cb)
+		var row2 := HBoxContainer.new()
+		row2.add_theme_constant_override("separation", 6)
+		p.add_child(row2)
+		lang_out_opt = OptionButton.new()
+		for l in LANGS:
+			lang_out_opt.add_item(("→ " + l[0]) if l[0] != "Sans traduction" else l[0])
+		lang_out_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row2.add_child(lang_out_opt)
+		var fixb := Button.new()
+		fixb.text = "Corriger"
+		fixb.pressed.connect(func(): _ai_text("fix"))
+		row2.add_child(fixb)
+		var trb := Button.new()
+		trb.text = "Traduire"
+		trb.pressed.connect(func(): _ai_text("translate"))
+		row2.add_child(trb)
+		# 2) barre : capture, vues, zoom
+		var tb := HBoxContainer.new()
+		tb.add_theme_constant_override("separation", 6)
+		p.add_child(tb)
+		var cam := Button.new()
+		cam.icon = _cam_tex()
+		cam.custom_minimum_size = Vector2(48, 40)
+		cam.pressed.connect(func(): _request_shot(true))
+		tb.add_child(cam)
+		for i in 2:
+			var vb := Button.new()
+			vb.text = ["Liste", "Image"][i]
+			vb.toggle_mode = true
+			vb.custom_minimum_size = Vector2(0, 40)
+			vb.pressed.connect(_set_view.bind(i))
+			tb.add_child(vb)
+			view_btns.append(vb)
+		zoom_box = HBoxContainer.new()
+		zoom_box.add_theme_constant_override("separation", 4)
+		tb.add_child(zoom_box)
+		var zo := Button.new()
+		zo.text = "−"
+		zo.custom_minimum_size = Vector2(40, 40)
+		zo.pressed.connect(func(): _chat_zoom(-1))
+		zoom_box.add_child(zo)
+		zoom_lbl = Label.new()
+		zoom_lbl.text = "×1"
+		zoom_box.add_child(zoom_lbl)
+		var zi := Button.new()
+		zi.text = "+"
+		zi.custom_minimum_size = Vector2(40, 40)
+		zi.pressed.connect(func(): _chat_zoom(1))
+		zoom_box.add_child(zi)
+		var sp := Control.new()
+		sp.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		tb.add_child(sp)
+		chat_status = Label.new()
+		chat_status.add_theme_font_size_override("font_size", 13)
+		chat_status.modulate = Color(1, 1, 1, 0.7)
+		chat_status.clip_text = true
+		tb.add_child(chat_status)
+		var gear := Button.new()
+		gear.text = "⚙"
+		gear.custom_minimum_size = Vector2(40, 40)
+		tb.add_child(gear)
+		# 3) liste des messages / image
+		list_panel = PanelContainer.new()
+		list_panel.add_theme_stylebox_override("panel", _sbox(Color("07090d"), 10, 4, 4, C_BG3, 2))
+		list_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		p.add_child(list_panel)
+		var ls := ScrollContainer.new()
+		ls.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		list_panel.add_child(ls)
+		chat_list = VBoxContainer.new()
+		chat_list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		chat_list.add_theme_constant_override("separation", 6)
+		ls.add_child(chat_list)
+		viewer_panel = PanelContainer.new()
+		viewer_panel.add_theme_stylebox_override("panel", _sbox(Color("07090d"), 10, 4, 4, C_BG3, 2))
+		viewer_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		viewer_panel.visible = false
+		p.add_child(viewer_panel)
+		chat_scroll = ScrollContainer.new()
+		chat_scroll.resized.connect(_chat_zoom_apply)
+		viewer_panel.add_child(chat_scroll)
+		chat_scroll.add_child(shot_prev)
+		sel_box = SelBox.new()
+		sel_box.set_anchors_preset(Control.PRESET_FULL_RECT)
+		sel_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		shot_prev.add_child(sel_box)
+		shot_prev.mouse_filter = Control.MOUSE_FILTER_STOP
+		shot_prev.gui_input.connect(_sel_input)
+		# 4) réglages repliés
 		var box := VBoxContainer.new()
 		box.visible = false
 		box.add_theme_constant_override("separation", 4)
@@ -691,14 +787,41 @@ func _build_screen_tab(parent: Node) -> void:
 			sl.custom_minimum_size = Vector2(0, 28)
 			hr.add_child(sl)
 			shot_sl.append(sl)
-		chat_enter = CheckButton.new()
-		chat_enter.text = "« ! » puis Entrée autour de la capture"
-		chat_enter.button_pressed = true
-		box.add_child(chat_enter)
 		sel_tg = Button.new()
 		sel_tg.text = "Choisir la zone sur l'écran du PC"
 		sel_tg.pressed.connect(_sel_start)
 		box.add_child(sel_tg)
+		chat_enter = CheckButton.new()
+		chat_enter.text = "« ! » puis Entrée autour de la capture"
+		chat_enter.button_pressed = true
+		box.add_child(chat_enter)
+		tr_in_check = CheckButton.new()
+		tr_in_check.text = "Traduire les messages reçus en français"
+		tr_in_check.button_pressed = true
+		box.add_child(tr_in_check)
+		var tr2 := HBoxContainer.new()
+		box.add_child(tr2)
+		var tl2 := Label.new()
+		tl2.text = "Dictée"
+		tl2.custom_minimum_size = Vector2(70, 0)
+		tr2.add_child(tl2)
+		lang_in_opt = OptionButton.new()
+		for l in [LANGS[10]] + LANGS.slice(1, 10):
+			lang_in_opt.add_item(l[0])
+		lang_in_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		tr2.add_child(lang_in_opt)
+		var tr3 := HBoxContainer.new()
+		box.add_child(tr3)
+		var tl3 := Label.new()
+		tl3.text = "Ton IA"
+		tl3.custom_minimum_size = Vector2(70, 0)
+		tr3.add_child(tl3)
+		tone_opt = OptionButton.new()
+		for t in ["Amical", "Sérieux", "Humoristique", "Militaire"]:
+			tone_opt.add_item(t)
+		tone_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		tr3.add_child(tone_opt)
+		_set_view(0)
 	else:
 		shot_info = Label.new()
 		p.add_child(shot_info)
@@ -712,8 +835,147 @@ func _build_screen_tab(parent: Node) -> void:
 			c.set_value("pc", "chat", on)
 			c.save("user://pref.cfg"))
 		p.add_child(chat_allow)
+		ai_opt = OptionButton.new()
+		ai_opt.item_selected.connect(func(i):
+			ai_model = ai_opt.get_item_text(i)
+			var c := ConfigFile.new()
+			c.load("user://pref.cfg")
+			c.set_value("pc", "ai_model", ai_model)
+			c.save("user://pref.cfg"))
+		p.add_child(ai_opt)
 		shot_prev.custom_minimum_size = Vector2(0, 150)
 		p.add_child(shot_prev)
+
+
+func _set_view(v: int) -> void:
+	list_panel.visible = v == 0
+	viewer_panel.visible = v == 1
+	zoom_box.visible = v == 1
+	for i in view_btns.size():
+		view_btns[i].button_pressed = i == v
+
+
+func _chat_show_list(entries: Array) -> void:
+	chat_entries = entries
+	for c in chat_list.get_children():
+		c.queue_free()
+	for i in entries.size():
+		var e: Dictionary = entries[i]
+		var card := PanelContainer.new()
+		card.add_theme_stylebox_override("panel", _sbox(C_BG2, 10, 10, 8))
+		chat_list.add_child(card)
+		var v := VBoxContainer.new()
+		v.add_theme_constant_override("separation", 2)
+		card.add_child(v)
+		var top := HBoxContainer.new()
+		v.add_child(top)
+		var nl := Label.new()
+		nl.text = str(e.get("n", ""))
+		nl.add_theme_color_override("font_color", C_ACC)
+		nl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		nl.clip_text = true
+		top.add_child(nl)
+		var ib := Button.new()
+		ib.text = "IA"
+		ib.custom_minimum_size = Vector2(52, 32)
+		ib.pressed.connect(_ai_reply.bind(i))
+		top.add_child(ib)
+		var ml := Label.new()
+		ml.text = str(e.get("m", ""))
+		ml.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		v.add_child(ml)
+		if e.has("t"):
+			var tl := Label.new()
+			tl.text = "→ " + str(e["t"])
+			tl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			tl.add_theme_color_override("font_color", Color("7fd48b"))
+			tl.add_theme_font_size_override("font_size", 14)
+			v.add_child(tl)
+
+
+func _ai_send(d: Dictionary) -> void:
+	chat_status.text = "IA…"
+	_send(T_AI, JSON.stringify(d).to_utf8_buffer())
+
+
+func _ai_reply(i: int) -> void:
+	var ctx: Array = []
+	for k in range(maxi(0, i - 6), i + 1):
+		ctx.append("%s: %s" % [chat_entries[k].get("n", ""), chat_entries[k].get("m", "")])
+	_ai_send({"op": "reply", "text": str(chat_entries[i].get("m", "")), "n": str(chat_entries[i].get("n", "")),
+			"ctx": ctx, "tone": tone_opt.selected})
+
+
+func _ai_text(op: String) -> void:
+	var t := chat_edit.text.strip_edges()
+	if t == "":
+		chat_status.text = "Écris ou dicte d'abord"
+		return
+	if op == "translate" and lang_out_opt.selected == 0:
+		chat_status.text = "Choisis une langue"
+		return
+	_ai_send({"op": op, "text": t, "lang": LANGS[lang_out_opt.selected][1]})
+
+
+## Dictée : un appui démarre l'écoute, un second l'arrête et envoie la voix au PC.
+func _dict_toggle() -> void:
+	if not dict_on:
+		if peer == null or not linked:
+			chat_status.text = "Pas de PC connecté"
+			return
+		dict_on = true
+		dict_buf = PackedFloat32Array()
+		dict_t = Time.get_ticks_msec()
+		cap.clear_buffer()
+		mic_btn.modulate = Color("ff5555")
+		chat_status.text = "Je t'écoute…"
+	else:
+		_dict_stop()
+
+
+func _dict_feed(fr: PackedVector2Array) -> void:
+	for v in fr:
+		dict_buf.append((v.x + v.y) * 0.5)
+	if dict_buf.size() > int(AudioServer.get_mix_rate()) * 25:
+		_dict_stop()
+
+
+func _dict_stop() -> void:
+	dict_on = false
+	mic_btn.modulate = Color.WHITE
+	var rate := AudioServer.get_mix_rate()
+	var ratio := rate / 16000.0
+	var n := int(dict_buf.size() / ratio)
+	if n < 6400:
+		chat_status.text = "Trop court"
+		return
+	var pcm := PackedByteArray()
+	pcm.resize(n * 2)
+	var last := dict_buf.size() - 1
+	for i in n:
+		var pos := i * ratio
+		var i0 := int(pos)
+		var v := lerpf(dict_buf[i0], dict_buf[mini(i0 + 1, last)], pos - i0)
+		pcm.encode_s16(i * 2, int(clampf(v, -1.0, 1.0) * 32767.0))
+	dict_buf = PackedFloat32Array()
+	var lin: String = ([LANGS[10]] + LANGS.slice(1, 10))[lang_in_opt.selected][2]
+	var lout: String = LANGS[lang_out_opt.selected][1]
+	var pos2 := 0
+	while pos2 < pcm.size():
+		var m := mini(32000, pcm.size() - pos2)
+		var fl := (1 if pos2 == 0 else 0) | (2 if pos2 + m >= pcm.size() else 0)
+		var c := PackedByteArray([fl])
+		if pos2 == 0:
+			var a := lin.to_utf8_buffer()
+			var b := lout.to_utf8_buffer()
+			c.append(a.size())
+			c.append_array(a)
+			c.append(b.size())
+			c.append_array(b)
+		c.append_array(pcm.slice(pos2, pos2 + m))
+		_send(T_VOICE, c)
+		pos2 += m
+	chat_status.text = "Transcription…"
 
 
 const ZOOMS := [1.0, 1.5, 2.0, 3.0, 4.0]
@@ -737,6 +999,7 @@ func _chat_zoom_apply() -> void:
 
 ## Choix de la zone : le PC envoie tout l'écran, on dessine un rectangle dessus.
 func _sel_start() -> void:
+	_set_view(1)
 	chat_zoom = 1.0
 	zoom_lbl.text = "×1"
 	selecting = true
@@ -1159,10 +1422,47 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 			var im := Image.new()
 			if im.load_jpg_from_buffer(shot_buf) == OK:
 				var tx := ImageTexture.create_from_image(im)
+				chat_status.text = "Lecture du texte…"
 				shot_view.texture = tx
 				shot_prev.texture = tx
 				_chat_zoom_apply()
 				shot_until = Time.get_ticks_msec() + int(shot_sl[4].value) * 1000
+		return
+	if t == T_CHATLIST and is_phone:
+		var d = JSON.parse_string(pl.get_string_from_utf8())
+		if typeof(d) == TYPE_DICTIONARY and typeof(d.get("e")) == TYPE_ARRAY:
+			var es: Array = d["e"]
+			chat_status.text = ""
+			if es.is_empty():
+				chat_status.text = "Aucun texte lu"
+				_set_view(1)
+			else:
+				_chat_show_list(es)
+				_set_view(0)
+		return
+	if t == T_AIRES and is_phone:
+		var d2 = JSON.parse_string(pl.get_string_from_utf8())
+		if typeof(d2) == TYPE_DICTIONARY:
+			if d2.get("ok", false):
+				chat_edit.text = str(d2.get("text", ""))
+				chat_status.text = "Prêt à envoyer"
+			else:
+				chat_status.text = str(d2.get("text", "Erreur IA"))
+		return
+	if t == T_VOICERES and is_phone:
+		var d3 = JSON.parse_string(pl.get_string_from_utf8())
+		if typeof(d3) == TYPE_DICTIONARY:
+			if d3.get("ok", false):
+				chat_edit.text = str(d3.get("text", ""))
+				chat_status.text = "Prêt à envoyer"
+			else:
+				chat_status.text = str(d3.get("text", "Erreur"))
+		return
+	if t == T_AI and not is_phone:
+		_pc_ai(pl)
+		return
+	if t == T_VOICE and not is_phone and pl.size() >= 2:
+		_voice_chunk(pl)
 		return
 	if t == T_SHOTREQ and not is_phone and pl.size() >= 4:
 		_pc_shot(pl)
@@ -1283,6 +1583,8 @@ func _phone_process() -> void:
 	while n >= CHUNK:
 		var fr := cap.get_buffer(CHUNK)
 		n -= CHUNK
+		if dict_on:
+			_dict_feed(fr)
 		if not mic_check.button_pressed:
 			continue
 		var b := PackedByteArray()
@@ -1449,6 +1751,7 @@ func _pc_init() -> void:
 	DisplayServer.window_set_title("USB Speaker")
 	_pc_cleanup_leftovers()
 	_set_host(host_check.button_pressed)
+	_ai_models_load()
 	for c in [OS.get_environment("USBSPK_ADB"), OS.get_executable_path().get_base_dir() + "/adb",
 			OS.get_environment("HOME") + "/.local/opt/android-sdk/platform-tools/adb"]:
 		if c != "" and FileAccess.file_exists(c):
@@ -1737,6 +2040,15 @@ func _pc_shutdown() -> void:
 	if quit:
 		return
 	quit = true
+	if stt_pid > 0:
+		OS.kill(stt_pid)
+		stt_pid = -1
+	if stt_th != null:
+		stt_th.wait_to_finish()
+		stt_th = null
+	if ocr_th != null:
+		ocr_th.wait_to_finish()
+		ocr_th = null
 	if host_srv != null:
 		host_srv.stop()
 		host_srv = null
@@ -1976,7 +2288,8 @@ func _request_shot(_show_prev: bool, keys := true, full := false) -> void:
 	else:
 		for i in 4:
 			b.append(int(shot_sl[i].value))
-		b.append(1 if (keys and chat_enter.button_pressed) else 0)
+		b.append((1 if (keys and chat_enter.button_pressed) else 0) | (2 if tr_in_check.button_pressed else 0))
+	chat_status.text = "Capture…"
 	_send(T_SHOTREQ, b)
 
 
@@ -2201,6 +2514,300 @@ func _pc_shot(pl: PackedByteArray) -> void:
 		c.append_array(jpg.slice(pos, pos + n))
 		_send(T_SHOT, c)
 		pos += n
+	# lecture du texte (sauf capture de tout l'écran pour choisir la zone)
+	if not ocr_busy and not (pl[2] >= 100 and pl[3] >= 100):
+		ocr_busy = true
+		ocr_th = Thread.new()
+		ocr_th.start(_ocr_run.bind(im.duplicate(), pl.size() >= 5 and (pl[4] & 2) != 0))
+
+
+# ------------------------------------------------------------------ Chat intelligent (PC)
+
+## Thread : OCR Tesseract de la capture, puis découpage en « nom : message ».
+func _ocr_run(img: Image, tr: bool) -> void:
+	var path := OS.get_user_data_dir() + "/usbspk_ocr.png"
+	var w := img.get_width()
+	var k := 3 if w < 500 else (2 if w < 1000 else 1)
+	if k > 1:
+		img.resize(w * k, img.get_height() * k, Image.INTERPOLATE_LANCZOS)
+	img.convert(Image.FORMAT_L8)
+	img.save_png(path)
+	var out: Array = []
+	OS.execute("tesseract", [path, "stdout", "-l", "fra+eng", "--psm", "6"], out, false)
+	call_deferred("_ocr_done", _parse_chat("".join(out)), tr)
+
+
+func _parse_chat(text: String) -> Array:
+	var rx := RegEx.create_from_string("^\\s*(?:[\\[\\(<][^\\]\\)>]{1,24}[\\]\\)>]\\s*)?([^:\\n]{1,32}?)\\s*[:：]\\s*(.+)$")
+	var out: Array = []
+	for raw in text.split("\n"):
+		var line := raw.strip_edges()
+		if line.length() < 2:
+			continue
+		var m := rx.search(line)
+		if m:
+			out.append({"n": m.get_string(1).strip_edges(), "m": m.get_string(2).strip_edges()})
+		elif out.size() > 0:
+			out[out.size() - 1]["m"] = str(out[out.size() - 1]["m"]) + " " + line
+		else:
+			out.append({"n": "", "m": line})
+	return out.slice(maxi(0, out.size() - 20))
+
+
+func _ocr_done(entries: Array, tr: bool) -> void:
+	if ocr_th != null:
+		ocr_th.wait_to_finish()
+		ocr_th = null
+	ocr_busy = false
+	_send(T_CHATLIST, JSON.stringify({"e": entries}).to_utf8_buffer())
+	if tr and not entries.is_empty():
+		_ai_translate_list(entries)
+
+
+func _send_json(t: int, d: Dictionary) -> void:
+	_send(t, JSON.stringify(d).to_utf8_buffer())
+
+
+## Appel Ollama local (aucune donnée ne quitte le PC). cb(ok: bool, texte: String)
+func _ollama(messages: Array, json_mode: bool, num_predict: int, cb: Callable) -> void:
+	if ai_model == "":
+		cb.call(false, "Aucun modèle Ollama")
+		return
+	var h := HTTPRequest.new()
+	h.timeout = 90.0
+	add_child(h)
+	h.request_completed.connect(func(res: int, code: int, _hd: PackedStringArray, body: PackedByteArray):
+		h.queue_free()
+		var d = JSON.parse_string(body.get_string_from_utf8()) if res == HTTPRequest.RESULT_SUCCESS and code == 200 else null
+		if typeof(d) != TYPE_DICTIONARY or not d.has("message"):
+			cb.call(false, "Ollama indisponible")
+			return
+		var txt := str(d["message"].get("content", ""))
+		txt = RegEx.create_from_string("(?s)<think>.*?</think>").sub(txt, "", true).strip_edges()
+		cb.call(true, txt))
+	var req := {"model": ai_model, "stream": false, "keep_alive": "5m",
+			"options": {"num_predict": num_predict, "temperature": 0.6}, "messages": messages}
+	if json_mode:
+		req["format"] = "json"
+	h.request("http://127.0.0.1:11434/api/chat", ["Content-Type: application/json"],
+			HTTPClient.METHOD_POST, JSON.stringify(req))
+
+
+func _clean_reply(t: String) -> String:
+	t = t.replace("\n", " ").strip_edges()
+	for q in ["\"", "«", "»", "“", "”"]:
+		t = t.trim_prefix(q).trim_suffix(q)
+	return t.strip_edges().substr(0, 200)
+
+
+func _ai_translate_list(entries: Array) -> void:
+	var lines := PackedStringArray()
+	for i in entries.size():
+		lines.append("%d. %s" % [i + 1, entries[i]["m"]])
+	var sys := "Tu traduis des messages de chat de jeu vidéo en français. Pour chaque message numéroté, donne la traduction française (si le message est déjà en français, recopie-le tel quel). Réponds uniquement en JSON : {\"t\": [\"...\", ...]} avec exactement %d éléments, dans l'ordre." % entries.size()
+	_ollama([{"role": "system", "content": sys}, {"role": "user", "content": "\n".join(lines)}], true, 700,
+		func(ok: bool, out: String):
+			if not ok:
+				return
+			var d = JSON.parse_string(out)
+			if typeof(d) != TYPE_DICTIONARY or typeof(d.get("t")) != TYPE_ARRAY or d["t"].size() != entries.size():
+				return
+			for i in entries.size():
+				var t := str(d["t"][i]).strip_edges()
+				if t != "" and t.to_lower() != str(entries[i]["m"]).to_lower():
+					entries[i]["t"] = t
+			_send_json(T_CHATLIST, {"e": entries}))
+
+
+## Le téléphone demande : répondre à un joueur, traduire ou corriger un texte.
+func _pc_ai(pl: PackedByteArray) -> void:
+	var d = JSON.parse_string(pl.get_string_from_utf8())
+	if typeof(d) != TYPE_DICTIONARY:
+		return
+	var op := str(d.get("op", ""))
+	var text := str(d.get("text", "")).strip_edges()
+	var sys := ""
+	var user := text
+	if op == "reply":
+		if text == "":
+			_send_json(T_AIRES, {"ok": false, "op": op, "text": "Texte vide"})
+			return
+		# 1) langue du message (appel court), 2) réponse imposée dans cette langue
+		_ollama([{"role": "system", "content": "Name the language of the user's message. Answer with ONE English word only (English, French, Spanish, German, Italian, Portuguese, Russian, Polish, Ukrainian, Dutch...)."},
+				{"role": "user", "content": text}], false, 6,
+			func(ok: bool, lang: String):
+				lang = lang.strip_edges().get_slice(" ", 0).trim_suffix(".") if ok and lang != "" else "the same language as the message"
+				var tones := ["friendly", "serious and concise", "humorous", "military radio style"]
+				var tone: String = tones[clampi(int(d.get("tone", 0)), 0, tones.size() - 1)]
+				var sysr := "You are a player of Arma Reforger (military simulation game) answering in the game chat. Write ONE short sentence (120 characters max), tone: %s, no quotation marks, no name prefix, no emoji. You MUST write your answer in %s." % [tone, lang]
+				var userr := "Last chat messages:\n%s\n\nReply to %s who wrote: %s" % ["\n".join(PackedStringArray(d.get("ctx", []))), str(d.get("n", "")), text]
+				_ollama([{"role": "system", "content": sysr}, {"role": "user", "content": userr}], false, 120,
+					func(ok2: bool, out: String):
+						_send_json(T_AIRES, {"ok": ok2, "op": op, "text": _clean_reply(out) if ok2 else out})))
+		return
+	elif op == "translate":
+		sys = "Tu traduis des messages de chat de jeu vidéo en %s. Garde le sens, le ton et l'argot de jeu. Réponds uniquement par la traduction, sans guillemets." % str(d.get("lang", "English"))
+	elif op == "fix":
+		sys = "Corrige l'orthographe, la grammaire et la ponctuation du message sans changer le sens ni la langue. Réponds uniquement par le texte corrigé, sans guillemets."
+	else:
+		return
+	if text == "":
+		_send_json(T_AIRES, {"ok": false, "op": op, "text": "Texte vide"})
+		return
+	_ollama([{"role": "system", "content": sys}, {"role": "user", "content": user}], false, 120,
+		func(ok: bool, out: String):
+			_send_json(T_AIRES, {"ok": ok, "op": op, "text": _clean_reply(out) if ok else out}))
+
+
+## Liste des modèles Ollama du PC ; choix mémorisé, sinon un petit modèle (la carte sert au jeu).
+func _ai_models_load() -> void:
+	var h := HTTPRequest.new()
+	h.timeout = 5.0
+	add_child(h)
+	h.request_completed.connect(func(res: int, code: int, _hd: PackedStringArray, body: PackedByteArray):
+		h.queue_free()
+		var d = JSON.parse_string(body.get_string_from_utf8()) if res == HTTPRequest.RESULT_SUCCESS and code == 200 else null
+		ai_opt.clear()
+		if typeof(d) != TYPE_DICTIONARY:
+			ai_opt.add_item("IA : Ollama indisponible")
+			return
+		var names: Array = []
+		for m in d.get("models", []):
+			names.append(str(m["name"]))
+			ai_opt.add_item(str(m["name"]))
+		var cf := ConfigFile.new()
+		cf.load("user://pref.cfg")
+		var want := str(cf.get_value("pc", "ai_model", ""))
+		if want == "" or not names.has(want):
+			for pref in ["gemma3:4b", "llama3.2:3b", "qwen3:8b", "llama3.1:8b"]:
+				if names.has(pref):
+					want = pref
+					break
+		if want == "" and not names.is_empty():
+			want = names[0]
+		ai_model = want
+		if names.has(want):
+			ai_opt.select(names.find(want)))
+	h.request("http://127.0.0.1:11434/api/tags")
+
+
+# ------------------------------------------------------------------ Dictée (PC) : Whisper local
+
+const STT_PY := """import sys, json, whisper
+m = whisper.load_model('small', device='cpu')
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    try:
+        q = json.loads(line)
+        r = m.transcribe(q['wav'], language=q.get('lang') or None, fp16=False,
+                         condition_on_previous_text=False, initial_prompt=q.get('prompt'))
+        print(json.dumps({'text': r['text'].strip()}), flush=True)
+    except Exception as e:
+        print(json.dumps({'error': str(e)}), flush=True)
+"""
+
+
+func _stt_start() -> bool:
+	if stt_pid > 0 and OS.is_process_running(stt_pid):
+		return true
+	var path := OS.get_user_data_dir() + "/usbspk_stt.py"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return false
+	f.store_string(STT_PY)
+	f.close()
+	var io := OS.execute_with_pipe("python3", ["-u", path], false)
+	if not io.has("pid"):
+		return false
+	stt_pid = io["pid"]
+	stt_io = io["stdio"]
+	if stt_th != null:
+		stt_th.wait_to_finish()
+	stt_th = Thread.new()
+	stt_th.start(_stt_loop)
+	return true
+
+
+func _stt_loop() -> void:
+	while stt_pid > 0 and not quit:
+		var l := stt_io.get_line()
+		if l == "":
+			if not OS.is_process_running(stt_pid):
+				break
+			OS.delay_msec(20)
+			continue
+		call_deferred("_stt_line", l)
+
+
+func _voice_chunk(pl: PackedByteArray) -> void:
+	var off := 1
+	if pl[0] & 1:
+		voice_buf = PackedByteArray()
+		if pl.size() < 3:
+			return
+		var l1: int = pl[1]
+		voice_lang = pl.slice(2, 2 + l1).get_string_from_utf8()
+		off = 2 + l1
+		if pl.size() <= off:
+			return
+		var l2: int = pl[off]
+		voice_out = pl.slice(off + 1, off + 1 + l2).get_string_from_utf8()
+		off += 1 + l2
+	voice_buf.append_array(pl.slice(off))
+	if pl[0] & 2:
+		_voice_done()
+
+
+func _voice_done() -> void:
+	var n := voice_buf.size()
+	if n < 6400:
+		_send_json(T_VOICERES, {"ok": false, "text": "Trop court"})
+		return
+	var h := PackedByteArray()
+	h.resize(44)
+	h.encode_u32(0, 0x46464952)
+	h.encode_u32(4, 36 + n)
+	h.encode_u32(8, 0x45564157)
+	h.encode_u32(12, 0x20746d66)
+	h.encode_u32(16, 16)
+	h.encode_u16(20, 1)
+	h.encode_u16(22, 1)
+	h.encode_u32(24, 16000)
+	h.encode_u32(28, 32000)
+	h.encode_u16(32, 2)
+	h.encode_u16(34, 16)
+	h.encode_u32(36, 0x61746164)
+	h.encode_u32(40, n)
+	h.append_array(voice_buf)
+	var path := OS.get_user_data_dir() + "/usbspk_voice.wav"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null or not _stt_start():
+		_send_json(T_VOICERES, {"ok": false, "text": "Dictée indisponible"})
+		return
+	f.store_buffer(h)
+	f.close()
+	stt_io.store_line(JSON.stringify({"wav": path, "lang": voice_lang,
+			"prompt": "Chat d'un jeu vidéo de simulation militaire, Arma Reforger."}))
+	stt_io.flush()
+
+
+func _stt_line(l: String) -> void:
+	var d = JSON.parse_string(l)
+	if typeof(d) != TYPE_DICTIONARY or d.has("ready"):
+		return
+	if d.has("error"):
+		_send_json(T_VOICERES, {"ok": false, "text": "Erreur de transcription"})
+		return
+	var text := str(d.get("text", "")).strip_edges()
+	if text == "":
+		_send_json(T_VOICERES, {"ok": false, "text": "Rien entendu"})
+	elif voice_out != "":
+		var sys := "Tu traduis des messages de chat de jeu vidéo en %s. Garde le sens et le ton. Réponds uniquement par la traduction, sans guillemets." % voice_out
+		_ollama([{"role": "system", "content": sys}, {"role": "user", "content": text}], false, 120,
+			func(ok: bool, out: String):
+				_send_json(T_VOICERES, {"ok": ok, "text": _clean_reply(out) if ok else out, "raw": text}))
+	else:
+		_send_json(T_VOICERES, {"ok": true, "text": text})
 
 
 func _apply_drive(pl: PackedByteArray) -> void:
