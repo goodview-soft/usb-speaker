@@ -6,12 +6,13 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 3  # versionCode de l'APK
-const APP_VERSION := "1.2.0"
+const VERSION := 4  # versionCode de l'APK
+const APP_VERSION := "1.3.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
-const T_HELLO := 3  # téléphone -> PC : u32 fréquence du micro
+const T_HELLO := 3  # téléphone -> PC : u32 fréquence du micro (= connexion acceptée)
+const T_NAME := 4  # PC -> téléphone : nom du PC (utf8)
 const SINK := "usbspk_out"
 const MIC_SINK := "usbspk_mic_sink"
 const MIC_SRC := "usbspk_mic"
@@ -56,6 +57,11 @@ var modules: PackedStringArray = []
 var try_t := 0.0
 var wait_t := 0.0
 var cand_i := 0
+var pending: Array = []
+var pend_box: VBoxContainer
+var pend_sig := ""
+var last_pc := ""
+var name_sent := false
 var http: HTTPRequest
 var dl: HTTPRequest
 var upd_btn: Button
@@ -135,6 +141,9 @@ func _build_ui() -> void:
 		vol_slider.value = 1.0
 		vol_slider.custom_minimum_size = Vector2(0, 48)
 		v.add_child(vol_slider)
+		pend_box = VBoxContainer.new()
+		pend_box.add_theme_constant_override("separation", 10)
+		v.add_child(pend_box)
 		mic_check = CheckButton.new()
 		mic_check.text = "Envoyer mon micro au PC"
 		mic_check.button_pressed = true
@@ -242,6 +251,9 @@ func _phone_init() -> void:
 		mic_player.play()
 	else:
 		OS.request_permissions()
+	var cf := ConfigFile.new()
+	if cf.load("user://pref.cfg") == OK:
+		last_pc = str(cf.get_value("pc", "last", ""))
 	server = TCPServer.new()
 	server.listen(PORT)
 	beacon.set_broadcast_enabled(true)
@@ -250,22 +262,16 @@ func _phone_init() -> void:
 
 
 func _phone_process() -> void:
-	if server.is_connection_available():
-		peer = server.take_connection()
-		peer.set_no_delay(true)
-		rxbuf.clear()
-		var h := PackedByteArray()
-		h.resize(4)
-		h.encode_u32(0, int(AudioServer.get_mix_rate()))
-		_send(T_HELLO, h)
-		cap.clear_buffer()
-		linked = true
-		_set_status("Enceinte active ✔", "Le son du PC sort ici.")
+	while server.is_connection_available():
+		var sp := server.take_connection()
+		sp.set_no_delay(true)
+		pending.append({"peer": sp, "buf": PackedByteArray(), "name": "", "t": Time.get_ticks_msec()})
+	_pending_poll()
+	var now0 := Time.get_ticks_msec()
+	if now0 - beacon_t > 1000:
+		beacon_t = now0
+		beacon.put_packet("USBSPK".to_utf8_buffer())
 	if peer == null:
-		var now := Time.get_ticks_msec()
-		if now - beacon_t > 1000:
-			beacon_t = now
-			beacon.put_packet("USBSPK".to_utf8_buffer())
 		return
 	if not _read():
 		peer = null
@@ -285,6 +291,69 @@ func _phone_process() -> void:
 			var s := (fr[i].x + fr[i].y) * 0.5
 			b.encode_s16(i * 2, int(clampf(s, -1.0, 1.0) * 32767.0))
 		_send(T_MIC, b)
+
+
+## Connexions entrantes pas encore acceptées : on lit le nom du PC, puis l'utilisateur choisit.
+func _pending_poll() -> void:
+	var sig := ""
+	for p in pending.duplicate():
+		var sp: StreamPeerTCP = p["peer"]
+		sp.poll()
+		if sp.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			pending.erase(p)
+			continue
+		var n := sp.get_available_bytes()
+		if n > 0:
+			var r := sp.get_data(n)
+			if r[0] == OK:
+				p["buf"].append_array(r[1])
+		var b: PackedByteArray = p["buf"]
+		if p["name"] == "" and b.size() >= 3:
+			var ln: int = b[1] | (b[2] << 8)
+			if b[0] == T_NAME and b.size() >= 3 + ln:
+				p["name"] = b.slice(3, 3 + ln).get_string_from_utf8()
+				p["buf"] = b.slice(3 + ln)
+		if p["name"] == "" and Time.get_ticks_msec() - int(p["t"]) > 2000:
+			p["name"] = "PC"
+		if p["name"] != "":
+			if peer == null and p["name"] == last_pc:
+				_accept(p)
+				continue
+			sig += "%s|" % p["name"]
+	if sig != pend_sig:
+		pend_sig = sig
+		for c in pend_box.get_children():
+			c.queue_free()
+		for p in pending:
+			if p["name"] == "":
+				continue
+			var bt := Button.new()
+			bt.custom_minimum_size = Vector2(0, 56)
+			bt.text = ("Basculer vers « %s »" if peer != null else "Connecter « %s »") % p["name"]
+			bt.pressed.connect(_accept.bind(p))
+			pend_box.add_child(bt)
+
+
+func _accept(p: Dictionary) -> void:
+	if not pending.has(p):
+		return
+	pending.erase(p)
+	pend_sig = "x"
+	if peer != null:
+		peer.disconnect_from_host()
+	peer = p["peer"]
+	rxbuf = p["buf"]
+	last_pc = p["name"]
+	var cf := ConfigFile.new()
+	cf.set_value("pc", "last", last_pc)
+	cf.save("user://pref.cfg")
+	var h := PackedByteArray()
+	h.resize(4)
+	h.encode_u32(0, int(AudioServer.get_mix_rate()))
+	_send(T_HELLO, h)
+	cap.clear_buffer()
+	linked = true
+	_set_status("Enceinte active ✔", "Connecté à « %s »." % last_pc)
 
 
 func _my_ips() -> String:
@@ -399,8 +468,13 @@ func _pc_process(delta: float) -> void:
 		if not _read():
 			_pc_unlink()
 			return
+		if peer.get_status() == StreamPeerTCP.STATUS_CONNECTED and not name_sent:
+			name_sent = true
+			_send(T_NAME, _pc_name().to_utf8_buffer())
 		if linked:
 			_pc_pump_capture()
+		elif name_sent:
+			_set_status("Téléphone trouvé", "Accepte la connexion sur le téléphone (« Connecter %s »)." % _pc_name())
 		return
 	mtx.lock()
 	var st := adb_state
@@ -429,6 +503,7 @@ func _pc_process(delta: float) -> void:
 		peer = StreamPeerTCP.new()
 		rxbuf.clear()
 		wait_t = 0.0
+		name_sent = false
 		peer.connect_to_host(host, PORT)
 
 
@@ -443,6 +518,12 @@ func _candidates() -> PackedStringArray:
 		if i >= 0 and i + 1 < p.size() and not p[i + 1] in out:
 			out.append(p[i + 1])
 	return out
+
+
+func _pc_name() -> String:
+	var f := FileAccess.open("/etc/hostname", FileAccess.READ)
+	var n := f.get_line().strip_edges() if f != null else ""
+	return n if n != "" else "PC"
 
 
 func _pc_unlink() -> void:
