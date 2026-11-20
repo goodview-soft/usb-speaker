@@ -6,8 +6,8 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 5  # versionCode de l'APK
-const APP_VERSION := "1.4.0"
+const VERSION := 6  # versionCode de l'APK
+const APP_VERSION := "1.4.1"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
@@ -16,7 +16,7 @@ const T_CTRL := 5  # téléphone -> PC : [son du PC voulu, micro envoyé]
 const T_NAME := 4  # PC -> téléphone : nom du PC (utf8)
 const SINK := "usbspk_out"
 const MIC_SINK := "usbspk_mic_sink"
-const MIC_SRC := "usbspk_mic"
+const MIC_SRC := "usbspk_mic_sink.monitor"
 const CHUNK := RATE / 50  # 20 ms
 
 var is_phone := OS.has_feature("android")
@@ -574,10 +574,8 @@ func _pc_link() -> void:
 	var m1 := _pa(["load-module", "module-null-sink", "sink_name=" + SINK,
 			"sink_properties=device.description=Telephone-USB"])
 	var m2 := _pa(["load-module", "module-null-sink", "sink_name=" + MIC_SINK,
-			"sink_properties=device.description=Micro-Telephone-interne"])
-	var m3 := _pa(["load-module", "module-remap-source", "master=" + MIC_SINK + ".monitor",
-			"source_name=" + MIC_SRC, "source_properties=device.description=Micro-Telephone"])
-	modules = PackedStringArray([m3, m2, m1])
+			"sink_properties=device.description=Micro-Telephone"])
+	modules = PackedStringArray([m2, m1])
 	_pc_route()
 	var io := OS.execute_with_pipe("parec", ["-d", SINK + ".monitor", "--format=s16le",
 			"--rate=%d" % RATE, "--channels=2", "--latency-msec=20"], false)
@@ -591,7 +589,7 @@ func _pc_link() -> void:
 	if mi.has("pid"):
 		mic_pid = mi["pid"]
 		mic_io = mi["stdio"]
-	_set_status("Téléphone connecté ✔", "Sortie « Telephone-USB » + micro « Micro-Telephone » actifs.")
+	_set_status("Téléphone connecté ✔", "Sortie « Telephone-USB » et micro « Micro-Telephone » prêts.")
 
 
 ## Envoie la sortie son du PC vers l'enceinte virtuelle (ou la rend au PC si décoché).
