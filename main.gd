@@ -489,10 +489,16 @@ func _pc_route() -> void:
 
 
 func _cap_loop() -> void:
-	while not quit:
-		var b := cap_io.get_buffer(CHUNK * 4)
-		if b.size() < CHUNK * 4:
-			break
+	while not quit and cap_pid > 0:
+		var b := PackedByteArray()
+		while b.size() < CHUNK * 4:
+			var part := cap_io.get_buffer(CHUNK * 4 - b.size())
+			if part.size() == 0:
+				if cap_pid <= 0 or not OS.is_process_running(cap_pid):
+					return
+				OS.delay_msec(4)
+				continue
+			b.append_array(part)
 		mtx.lock()
 		cap_queue.append(b)
 		if cap_queue.size() > 8:
