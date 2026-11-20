@@ -6,7 +6,7 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 1
+const VERSION := 2
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
 const T_HELLO := 3  # téléphone -> PC : u32 fréquence du micro
@@ -53,6 +53,12 @@ var prev_sink := ""
 var modules: PackedStringArray = []
 var try_t := 0.0
 var wait_t := 0.0
+var cand_i := 0
+var lan := PacketPeerUDP.new()
+var lan_ip := ""
+var lan_t := 0
+var beacon := PacketPeerUDP.new()
+var beacon_t := 0
 
 
 func _ready() -> void:
@@ -148,7 +154,11 @@ func _send(t: int, data: PackedByteArray) -> void:
 ## Lit les trames reçues ; retourne false si la connexion est perdue.
 func _read() -> bool:
 	peer.poll()
-	if peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+	var st := peer.get_status()
+	if st == StreamPeerTCP.STATUS_CONNECTING:
+		wait_t += get_process_delta_time()
+		return wait_t < 1.5
+	if st != StreamPeerTCP.STATUS_CONNECTED:
 		return false
 	var n := peer.get_available_bytes()
 	if n > 0:
@@ -220,7 +230,9 @@ func _phone_init() -> void:
 		OS.request_permissions()
 	server = TCPServer.new()
 	server.listen(PORT)
-	_set_status("En attente du PC", "Lance USB Speaker sur le PC et garde le câble branché.")
+	beacon.set_broadcast_enabled(true)
+	beacon.set_dest_address("255.255.255.255", PORT + 1)
+	_set_status("En attente du PC", "Lance USB Speaker sur le PC (même réseau Wi-Fi, ou câble USB).\n" + _my_ips())
 
 
 func _phone_process() -> void:
@@ -236,11 +248,15 @@ func _phone_process() -> void:
 		linked = true
 		_set_status("Enceinte active ✔", "Le son du PC sort ici.")
 	if peer == null:
+		var now := Time.get_ticks_msec()
+		if now - beacon_t > 1000:
+			beacon_t = now
+			beacon.put_packet("USBSPK".to_utf8_buffer())
 		return
 	if not _read():
 		peer = null
 		linked = false
-		_set_status("En attente du PC", "Connexion perdue.")
+		_set_status("En attente du PC", "Connexion perdue.\n" + _my_ips())
 		return
 	player.volume_db = linear_to_db(maxf(vol_slider.value, 0.0001))
 	var n := cap.get_frames_available()
@@ -255,6 +271,14 @@ func _phone_process() -> void:
 			var s := (fr[i].x + fr[i].y) * 0.5
 			b.encode_s16(i * 2, int(clampf(s, -1.0, 1.0) * 32767.0))
 		_send(T_MIC, b)
+
+
+func _my_ips() -> String:
+	var o := PackedStringArray()
+	for a in IP.get_local_addresses():
+		if a.contains(".") and not a.begins_with("127.") and not a.begins_with("169.254"):
+			o.append(a)
+	return "Adresse : " + ", ".join(o)
 
 
 func _phone_audio(pl: PackedByteArray) -> void:
@@ -285,6 +309,7 @@ func _pc_init() -> void:
 		if c != "" and FileAccess.file_exists(c):
 			adb_bin = c
 			break
+	lan.bind(PORT + 1)
 	_set_status("Branche ton téléphone", "Câble USB + débogage USB activé.")
 	th_adb = Thread.new()
 	th_adb.start(_adb_loop)
@@ -322,7 +347,7 @@ func _adb_loop() -> void:
 		if serial == "":
 			adb_state = "none"
 			adb_msg = "Autorise ce PC sur le téléphone (fenêtre « Autoriser le débogage USB »)." \
-				if unauth else "Câble USB + débogage USB activé (Options développeur)."
+				if unauth else "Câble USB + débogage USB (Options développeur)."
 			seen = ""
 		mtx.unlock()
 		if serial != "":
@@ -367,17 +392,43 @@ func _pc_process(delta: float) -> void:
 	var st := adb_state
 	var msg := adb_msg
 	mtx.unlock()
-	if st != "ready":
-		_set_status("Branche ton téléphone", msg)
-		return
-	_set_status("Téléphone détecté…", "Démarrage de l'app sur le téléphone.")
+	while lan.get_available_packet_count() > 0:
+		if lan.get_packet().get_string_from_utf8() == "USBSPK":
+			lan_ip = lan.get_packet_ip()
+			lan_t = Time.get_ticks_msec()
+	if lan_ip != "" and Time.get_ticks_msec() - lan_t > 4000:
+		lan_ip = ""
+	var host := "127.0.0.1"
+	if lan_ip != "":
+		host = lan_ip
+		_set_status("Téléphone trouvé…", "Connexion à " + lan_ip)
+	elif st != "ready":
+		_set_status("Branche ton téléphone", msg + "\nOu active le partage de connexion USB sur le téléphone.")
+		var c := _candidates()
+		host = c[cand_i % c.size()]
+		cand_i += 1
+	else:
+		_set_status("Téléphone détecté…", "Démarrage de l'app sur le téléphone.")
 	try_t -= delta
 	if try_t <= 0.0:
-		try_t = 1.0
+		try_t = 0.8
 		peer = StreamPeerTCP.new()
 		rxbuf.clear()
 		wait_t = 0.0
-		peer.connect_to_host("127.0.0.1", PORT)
+		peer.connect_to_host(host, PORT)
+
+
+## Adresses possibles du téléphone en partage de connexion USB (il est la passerelle du lien).
+func _candidates() -> PackedStringArray:
+	var out := PackedStringArray(["192.168.42.129", "192.168.42.1"])
+	var o: Array = []
+	OS.execute("ip", ["-4", "route", "show"], o, true)
+	for line in "".join(o).split("\n"):
+		var p := line.split(" ", false)
+		var i := p.find("via")
+		if i >= 0 and i + 1 < p.size() and not p[i + 1] in out:
+			out.append(p[i + 1])
+	return out
 
 
 func _pc_unlink() -> void:
