@@ -19,6 +19,12 @@ window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 window/handheld/orientation=1
 
+[input_devices]
+
+sensors/enable_accelerometer=true
+sensors/enable_gravity=true
+sensors/enable_gyroscope=true
+
 [rendering]
 
 renderer/rendering_method="gl_compatibility"

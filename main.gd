@@ -6,14 +6,18 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 8  # versionCode de l'APK
-const APP_VERSION := "1.6.0"
+const VERSION := 11  # versionCode de l'APK
+const APP_VERSION := "1.8.1"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
 const T_HELLO := 3  # téléphone -> PC : u32 fréquence du micro (= connexion acceptée)
 const T_CTRL := 5  # téléphone -> PC : [son du PC voulu, micro envoyé]
 const T_DRIVE := 6  # téléphone -> PC : 4×s16 sticks (LX LY RX RY), u8 LT, u8 RT, u16 boutons
+const BEACON_PORT := PORT + 4  # annonce des PC hôtes (UDP)
+const HOST_PORT := PORT + 5  # connexion téléphone -> PC hôte (TCP)
+const T_PING := 7  # aller-retour (latence) : u32 ms
+const T_PONG := 8
 const T_NAME := 4  # PC -> téléphone : nom du PC (utf8)
 const SINK := "usbspk_out"
 const MIC_SINK := "usbspk_mic_sink"
@@ -89,6 +93,33 @@ var pad_err: FileAccess
 var pad_last := ""
 var drive_t := 0
 var drive_v := [0, 0, 0, 0, 0, 0, 0]
+var link_lbl: Label
+var ip_lbl: Label
+var rtt_lbl: Label
+var net_hint: Label
+var link_opt: OptionButton
+var link_mode := 0  # 0 auto, 1 réseau Wi-Fi, 2 câble USB
+var cur_host := ""
+var rtt_ms := -1
+var ping_sent := 0
+var net_t := 0.0
+var udp_pad := PacketPeerUDP.new()
+var pad_rx := PacketPeerUDP.new()
+var seq_tx := 0
+var seq_rx := -1
+var last_pad_key := ""
+var last_pad_t := 0
+var host_on := true
+var host_srv: TCPServer
+var host_udp := PacketPeerUDP.new()
+var host_t := 0
+var host_check: CheckButton
+var host_rx := PacketPeerUDP.new()
+var hosts := {}
+var host_box: VBoxContainer
+var host_sig := ""
+var out_peer: StreamPeerTCP
+var out_t := 0
 var drive_check: CheckButton
 var sound_check: CheckButton
 var phone_sound := true
@@ -119,6 +150,11 @@ func _ready() -> void:
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_CLOSE_REQUEST and not is_phone:
 		_pc_shutdown()
+	elif is_phone and pad_ui != null and (what == NOTIFICATION_APPLICATION_FOCUS_OUT or what == NOTIFICATION_WM_WINDOW_FOCUS_OUT):
+		touches.clear()
+		owned.clear()
+		lstick.release()
+		rstick.release()
 
 
 func _exit_tree() -> void:
@@ -245,6 +281,7 @@ func _build_ui() -> void:
 		mic_check.button_pressed = true
 		p1.add_child(mic_check)
 	_build_drive_tab()
+	_build_net_tab()
 
 
 ## Zone tactile de la manette, placée par fractions de l'écran (centre cx, cy ; taille w, h).
@@ -317,6 +354,152 @@ func _build_drive_tab() -> void:
 		drive_check.text = "Manette virtuelle active"
 		drive_check.button_pressed = true
 		p.add_child(drive_check)
+
+
+func _build_net_tab() -> void:
+	var p := VBoxContainer.new()
+	p.name = "Connexion"
+	p.add_theme_constant_override("separation", 12)
+	tabs.add_child(p)
+	link_lbl = Label.new()
+	link_lbl.add_theme_font_size_override("font_size", 22)
+	link_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	p.add_child(link_lbl)
+	ip_lbl = Label.new()
+	ip_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	p.add_child(ip_lbl)
+	rtt_lbl = Label.new()
+	p.add_child(rtt_lbl)
+	net_hint = Label.new()
+	net_hint.modulate = Color(1, 1, 1, 0.6)
+	net_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	p.add_child(net_hint)
+	if is_phone:
+		var hl := Label.new()
+		hl.text = "Ordinateurs disponibles"
+		p.add_child(hl)
+		host_box = VBoxContainer.new()
+		host_box.add_theme_constant_override("separation", 8)
+		p.add_child(host_box)
+	else:
+		host_check = CheckButton.new()
+		host_check.text = "Mode hôte : le téléphone choisit ce PC"
+		var cf := ConfigFile.new()
+		host_check.button_pressed = not (cf.load("user://pref.cfg") == OK and not bool(cf.get_value("pc", "host", true)))
+		host_check.toggled.connect(_set_host)
+		p.add_child(host_check)
+	if not is_phone:
+		var l := Label.new()
+		l.text = "Mode de liaison"
+		p.add_child(l)
+		link_opt = OptionButton.new()
+		for t in ["Auto", "Réseau Wi-Fi", "Câble USB"]:
+			link_opt.add_item(t)
+		link_opt.item_selected.connect(func(i):
+			link_mode = i
+			_reconnect())
+		p.add_child(link_opt)
+	var rb := Button.new()
+	rb.text = "Reconnecter"
+	rb.custom_minimum_size = Vector2(0, 52)
+	rb.pressed.connect(_reconnect)
+	p.add_child(rb)
+
+
+func _bcast_addrs() -> PackedStringArray:
+	var out: PackedStringArray = ["255.255.255.255"]
+	for a in IP.get_local_addresses():
+		if a.contains(".") and not a.begins_with("127.") and not a.begins_with("169.254"):
+			out.append(a.substr(0, a.rfind(".")) + ".255")
+	return out
+
+
+## PC : active/désactive le mode hôte (le PC s'annonce, le téléphone se connecte).
+func _set_host(on: bool) -> void:
+	host_on = on
+	if on and host_srv == null:
+		host_srv = TCPServer.new()
+		host_srv.listen(HOST_PORT)
+		host_udp.set_broadcast_enabled(true)
+	elif not on and host_srv != null:
+		host_srv.stop()
+		host_srv = null
+	var cf := ConfigFile.new()
+	cf.load("user://pref.cfg")
+	cf.set_value("pc", "host", on)
+	cf.save("user://pref.cfg")
+	_reconnect()
+
+
+func _host_tick() -> void:
+	if host_srv == null:
+		return
+	if host_srv.is_connection_available():
+		var np := host_srv.take_connection()
+		if peer != null:
+			_pc_unlink()
+		peer = np
+		peer.set_no_delay(true)
+		rxbuf.clear()
+		wait_t = 0.0
+		name_sent = false
+		cur_host = peer.get_connected_host()
+	var now := Time.get_ticks_msec()
+	if now - host_t > 1000:
+		host_t = now
+		var msg := ("USBSPKHOST|%s" % _pc_name()).to_utf8_buffer()
+		for d in _bcast_addrs():
+			host_udp.set_dest_address(d, BEACON_PORT)
+			host_udp.put_packet(msg)
+
+
+func _reconnect() -> void:
+	if peer != null:
+		peer.disconnect_from_host()
+		if is_phone:
+			peer = null
+			linked = false
+			_set_status("En attente du PC", "Reconnexion…\n" + _my_ips())
+
+
+func _kind(host: String) -> String:
+	if host == "127.0.0.1":
+		return "Câble USB (adb)"
+	if host.begins_with("192.168.42."):
+		return "Câble USB (partage de connexion)"
+	return "Réseau Wi-Fi / local"
+
+
+func _net_tick(delta: float) -> void:
+	net_t -= delta
+	if net_t > 0.0:
+		return
+	net_t = 0.5
+	var connected := peer != null and linked
+	var now := Time.get_ticks_msec()
+	if connected and now - ping_sent > 1000:
+		ping_sent = now
+		var b := PackedByteArray()
+		b.resize(4)
+		b.encode_u32(0, now & 0x7fffffff)
+		_send(T_PING, b)
+	if not connected:
+		rtt_ms = -1
+		link_lbl.text = "Non connecté"
+		ip_lbl.text = _my_ips() if is_phone else ""
+		rtt_lbl.text = ""
+		net_hint.text = "Ouvre USB Speaker sur le PC et le téléphone (même Wi-Fi, ou câble USB)."
+		return
+	var host := peer.get_connected_host() if is_phone else cur_host
+	link_lbl.text = "Liaison : " + _kind(host)
+	ip_lbl.text = ("PC : " if is_phone else "Téléphone : ") + host
+	rtt_lbl.text = "Latence : %d ms" % rtt_ms if rtt_ms >= 0 else "Latence : …"
+	if rtt_ms > 60:
+		net_hint.text = "Liaison lente : rapproche-toi de la box, passe en Wi-Fi 5 GHz ou utilise le câble USB."
+	elif rtt_ms >= 0:
+		net_hint.text = "Liaison correcte."
+	else:
+		net_hint.text = ""
 
 
 func _build_pad_ui() -> void:
@@ -434,6 +617,12 @@ func _read() -> bool:
 
 
 func _on_frame(t: int, pl: PackedByteArray) -> void:
+	if t == T_PING:
+		_send(T_PONG, pl)
+		return
+	if t == T_PONG and pl.size() >= 4:
+		rtt_ms = clampi((Time.get_ticks_msec() & 0x7fffffff) - pl.decode_u32(0), 0, 9999)
+		return
 	if is_phone and t == T_AUDIO:
 		_phone_audio(pl)
 	elif not is_phone and t == T_MIC:
@@ -444,11 +633,7 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 			p = maxi(p, absi(pl.decode_s16(i)))
 		peak = maxf(peak, p / 32768.0)
 	elif not is_phone and t == T_DRIVE and pl.size() >= 12:
-		drive_v = [pl.decode_s16(0), pl.decode_s16(2), pl.decode_s16(4), pl.decode_s16(6), pl[8], pl[9], pl.decode_u16(10)]
-		drive_t = Time.get_ticks_msec()
-		wheel.steer = drive_v[0] / 32767.0
-		if drive_check.button_pressed:
-			_pad_start()
+		_apply_drive(pl)
 	elif not is_phone and t == T_CTRL and pl.size() >= 2:
 		phone_sound = pl[0] == 1
 		phone_mic = pl[1] == 1
@@ -466,7 +651,9 @@ func _process(delta: float) -> void:
 		_phone_process()
 	else:
 		_pc_process(delta)
+		_pad_rx()
 		_pad_tick()
+	_net_tick(delta)
 
 
 # ------------------------------------------------------------------ Téléphone
@@ -502,12 +689,15 @@ func _phone_init() -> void:
 		last_pc = str(cf.get_value("pc", "last", ""))
 	server = TCPServer.new()
 	server.listen(PORT)
+	host_rx.bind(BEACON_PORT)
 	beacon.set_broadcast_enabled(true)
 	beacon.set_dest_address("255.255.255.255", PORT + 1)
 	_set_status("En attente du PC", "Lance USB Speaker sur le PC (même réseau Wi-Fi, ou câble USB).\n" + _my_ips())
 
 
 func _phone_process() -> void:
+	_hosts_tick()
+	_out_tick()
 	while server.is_connection_available():
 		var sp := server.take_connection()
 		sp.set_no_delay(true)
@@ -540,6 +730,59 @@ func _phone_process() -> void:
 
 
 ## Connexions entrantes pas encore acceptées : on lit le nom du PC, puis l'utilisateur choisit.
+func _hosts_tick() -> void:
+	var now := Time.get_ticks_msec()
+	while host_rx.get_available_packet_count() > 0:
+		var t := host_rx.get_packet().get_string_from_utf8().split("|")
+		if t.size() >= 2 and t[0] == "USBSPKHOST":
+			hosts[host_rx.get_packet_ip()] = {"name": t[1], "t": now}
+	for ip in hosts.keys():
+		if now - int(hosts[ip]["t"]) > 4000:
+			hosts.erase(ip)
+	var cur := peer.get_connected_host() if peer != null else ""
+	var sig := cur + "|"
+	for ip in hosts:
+		sig += ip + hosts[ip]["name"] + "|"
+	if sig == host_sig:
+		return
+	host_sig = sig
+	for c in host_box.get_children():
+		c.queue_free()
+	if hosts.is_empty():
+		var l := Label.new()
+		l.text = "Aucun PC trouvé. Sur le PC : Connexion → Mode hôte."
+		l.modulate = Color(1, 1, 1, 0.6)
+		l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		host_box.add_child(l)
+	for ip in hosts:
+		var b := Button.new()
+		b.custom_minimum_size = Vector2(0, 56)
+		b.text = ("✔ " if ip == cur else "") + "%s  (%s)" % [hosts[ip]["name"], ip]
+		b.pressed.connect(_connect_host.bind(ip))
+		host_box.add_child(b)
+
+
+func _connect_host(ip: String) -> void:
+	out_peer = StreamPeerTCP.new()
+	out_peer.connect_to_host(ip, HOST_PORT)
+	out_t = Time.get_ticks_msec()
+	_set_status("Connexion…", ip)
+
+
+func _out_tick() -> void:
+	if out_peer == null:
+		return
+	out_peer.poll()
+	var st := out_peer.get_status()
+	if st == StreamPeerTCP.STATUS_CONNECTED:
+		out_peer.set_no_delay(true)
+		pending.append({"peer": out_peer, "buf": PackedByteArray(), "name": "", "t": Time.get_ticks_msec(), "auto": true})
+		out_peer = null
+	elif st != StreamPeerTCP.STATUS_CONNECTING or Time.get_ticks_msec() - out_t > 3000:
+		out_peer = null
+		_set_status("Connexion impossible", "Vérifie que le mode hôte est actif sur le PC.\n" + _my_ips())
+
+
 func _pending_poll() -> void:
 	var sig := ""
 	for p in pending.duplicate():
@@ -562,7 +805,7 @@ func _pending_poll() -> void:
 		if p["name"] == "" and Time.get_ticks_msec() - int(p["t"]) > 2000:
 			p["name"] = "PC"
 		if p["name"] != "":
-			if peer == null and p["name"] == last_pc:
+			if p.get("auto", false) or (peer == null and p["name"] == last_pc):
 				_accept(p)
 				continue
 			sig += "%s|" % p["name"]
@@ -590,6 +833,7 @@ func _accept(p: Dictionary) -> void:
 	peer = p["peer"]
 	rxbuf = p["buf"]
 	last_pc = p["name"]
+	seq_tx = 0
 	var cf := ConfigFile.new()
 	cf.set_value("pc", "last", last_pc)
 	cf.save("user://pref.cfg")
@@ -640,12 +884,14 @@ func _phone_audio(pl: PackedByteArray) -> void:
 func _pc_init() -> void:
 	DisplayServer.window_set_title("USB Speaker")
 	_pc_cleanup_leftovers()
+	_set_host(host_check.button_pressed)
 	for c in [OS.get_environment("USBSPK_ADB"), OS.get_executable_path().get_base_dir() + "/adb",
 			OS.get_environment("HOME") + "/.local/opt/android-sdk/platform-tools/adb"]:
 		if c != "" and FileAccess.file_exists(c):
 			adb_bin = c
 			break
 	lan.bind(PORT + 1)
+	pad_rx.bind(PORT + 3)
 	_set_status("Branche ton téléphone", "Câble USB + débogage USB activé.")
 	th_adb = Thread.new()
 	th_adb.start(_adb_loop)
@@ -717,6 +963,7 @@ func _adb_prepare() -> void:
 
 
 func _pc_process(delta: float) -> void:
+	_host_tick()
 	if peer != null:
 		if not _read():
 			_pc_unlink()
@@ -729,6 +976,9 @@ func _pc_process(delta: float) -> void:
 		elif name_sent:
 			_set_status("Téléphone trouvé", "Accepte la connexion sur le téléphone (« Connecter %s »)." % _pc_name())
 		return
+	if host_srv != null:
+		_set_status("Mode hôte actif", "Sur le téléphone : onglet Connexion → choisis « %s »." % _pc_name())
+		return
 	mtx.lock()
 	var st := adb_state
 	var msg := adb_msg
@@ -739,16 +989,20 @@ func _pc_process(delta: float) -> void:
 			lan_t = Time.get_ticks_msec()
 	if lan_ip != "" and Time.get_ticks_msec() - lan_t > 4000:
 		lan_ip = ""
-	var host := "127.0.0.1"
-	if lan_ip != "":
+	var host := ""
+	if lan_ip != "" and link_mode != 2:
 		host = lan_ip
 		_set_status("Téléphone trouvé…", "Connexion à " + lan_ip)
+	elif link_mode == 1:
+		_set_status("Cherche le téléphone sur le réseau…", "Ouvre USB Speaker sur le téléphone (même Wi-Fi).")
+		return
 	elif st != "ready":
 		_set_status("Branche ton téléphone", msg + "\nOu active le partage de connexion USB sur le téléphone.")
 		var c := _candidates()
 		host = c[cand_i % c.size()]
 		cand_i += 1
 	else:
+		host = "127.0.0.1"
 		_set_status("Téléphone détecté…", "Démarrage de l'app sur le téléphone.")
 	try_t -= delta
 	if try_t <= 0.0:
@@ -757,6 +1011,7 @@ func _pc_process(delta: float) -> void:
 		rxbuf.clear()
 		wait_t = 0.0
 		name_sent = false
+		cur_host = host
 		peer.connect_to_host(host, PORT)
 
 
@@ -798,6 +1053,7 @@ func _pc_link() -> void:
 	if linked:
 		return
 	linked = true
+	seq_rx = -1
 	phone_sound = true
 	phone_mic = false
 	prev_src = _pa(["get-default-source"])
@@ -917,6 +1173,9 @@ func _pc_shutdown() -> void:
 	if quit:
 		return
 	quit = true
+	if host_srv != null:
+		host_srv.stop()
+		host_srv = null
 	if linked:
 		linked = false
 		_pc_teardown()
@@ -1045,8 +1304,12 @@ func _drive_tick(delta: float) -> void:
 	if not pad_open:
 		if drive_was:
 			drive_was = false
-			_send(T_DRIVE, PackedByteArray([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+			for i in 3:
+				_send_pad(PackedByteArray([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), true)
 		return
+	for st in [lstick, rstick]:
+		if st.idx != -1 and not touches.has(st.idx):
+			st.release()
 	drive_was = true
 	var pr := {}
 	for k in touches:
@@ -1071,9 +1334,10 @@ func _drive_tick(delta: float) -> void:
 				pad_hint.text = ""
 		elif gyro_on:
 			var d := wrapf(ang - ang_off, -180.0, 180.0)
+			pad_hint.text = "Volant : %d°" % int(d) if g.length() >= 0.1 else "Capteur d'inclinaison indisponible"
 			var tgt := clampf(d / gyro_range, -1.0, 1.0) * (-1.0 if inv_btn.button_pressed else 1.0)
 			steer_s = lerpf(steer_s, tgt, clampf(delta * 25.0, 0.0, 1.0))
-			lx = steer_s
+			lx = clampf(lstick.v.x + steer_s, -1.0, 1.0)  # le joystick reste utilisable
 	var mask := 0
 	var bits := {"A": 0, "B": 1, "X": 2, "Y": 3, "LB": 4, "RB": 5, "Select": 6, "Start": 7,
 			"DUp": 10, "DDown": 11, "DLeft": 12, "DRight": 13}
@@ -1089,7 +1353,30 @@ func _drive_tick(delta: float) -> void:
 	b[8] = 255 if pr.has("LT") else 0
 	b[9] = 255 if pr.has("RT") else 0
 	b.encode_u16(10, mask)
-	_send(T_DRIVE, b)
+	_send_pad(b)
+
+
+## Manette : UDP (seul le dernier état compte, pas de retard cumulé) ; TCP si tunnel adb.
+func _send_pad(b: PackedByteArray, force := false) -> void:
+	var now := Time.get_ticks_msec()
+	var key := b.hex_encode()
+	if not force and key == last_pad_key and now - last_pad_t < 100:
+		return
+	last_pad_key = key
+	last_pad_t = now
+	if peer == null or not linked:
+		return
+	var host := peer.get_connected_host()
+	if host == "127.0.0.1" or host == "":
+		_send(T_DRIVE, b)
+		return
+	seq_tx = (seq_tx + 1) & 0x7fffffff
+	var p := PackedByteArray()
+	p.resize(4)
+	p.encode_u32(0, seq_tx)
+	p.append_array(b)
+	udp_pad.set_dest_address(host, PORT + 3)
+	udp_pad.put_packet(p)
 
 
 const PAD_PY := """import os, struct, fcntl, sys, time
@@ -1142,6 +1429,26 @@ finally:
 """
 
 
+func _apply_drive(pl: PackedByteArray) -> void:
+	drive_v = [pl.decode_s16(0), pl.decode_s16(2), pl.decode_s16(4), pl.decode_s16(6), pl[8], pl[9], pl.decode_u16(10)]
+	drive_t = Time.get_ticks_msec()
+	wheel.steer = drive_v[0] / 32767.0
+	if drive_check.button_pressed:
+		_pad_start()
+
+
+func _pad_rx() -> void:
+	while pad_rx.get_available_packet_count() > 0:
+		var pk := pad_rx.get_packet()
+		if not linked or peer == null or pad_rx.get_packet_ip() != peer.get_connected_host() or pk.size() < 16:
+			continue
+		var sq := pk.decode_u32(0)
+		if sq == seq_rx or (seq_rx >= 0 and ((sq - seq_rx) & 0x7fffffff) >= 0x3fffffff):
+			continue  # doublon ou paquet périmé
+		seq_rx = sq
+		_apply_drive(pk.slice(4))
+
+
 func _pad_start() -> void:
 	if pad_pid > 0 and OS.is_process_running(pad_pid):
 		return
@@ -1172,7 +1479,7 @@ func _pad_tick() -> void:
 		pad_io = null
 		return
 	var v: Array = drive_v
-	if Time.get_ticks_msec() - drive_t > 1000:
+	if Time.get_ticks_msec() - drive_t > 500:
 		v = [0, 0, 0, 0, 0, 0, 0]
 		wheel.steer = 0.0
 	var line := "%d %d %d %d %d %d %d" % v
