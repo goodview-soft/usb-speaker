@@ -6,8 +6,8 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 17  # versionCode de l'APK
-const APP_VERSION := "2.1.1"
+const VERSION := 18  # versionCode de l'APK
+const APP_VERSION := "2.2.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
@@ -139,6 +139,13 @@ var chat_panel: Panel
 var chat_line: LineEdit
 var kb_pid := -1
 var kb_io: FileAccess
+var chat_scroll: ScrollContainer
+var chat_zoom := 1.0
+var zoom_lbl: Label
+var sel_box: SelBox
+var selecting := false
+var sel_a := Vector2.ZERO
+var sel_tg: Button
 var margin: MarginContainer
 var status_panel: PanelContainer
 var pad_safe: Control
@@ -390,6 +397,18 @@ func _fit_pad() -> void:
 	pad_safe.offset_bottom = -b
 
 
+class SelBox extends Control:
+	var r := Rect2()
+	var active := false
+
+	func _draw() -> void:
+		if not active:
+			return
+		var rr := Rect2(r.position * size, r.size * size)
+		draw_rect(rr, Color(1, 0.3, 0.3, 0.25), true)
+		draw_rect(rr, Color("ff5555"), false, 2.0)
+
+
 class Stick extends Control:
 	var idx := -1
 	var v := Vector2.ZERO
@@ -581,14 +600,56 @@ func _build_game_tab() -> void:
 
 func _build_screen_tab(parent: Node) -> void:
 	var p := VBoxContainer.new()
-	p.name = "Écran"
+	p.name = "Chat"
 	p.add_theme_constant_override("separation", 8)
 	parent.add_child(p)
 	shot_prev = TextureRect.new()
-	shot_prev.custom_minimum_size = Vector2(0, 110)
 	shot_prev.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	shot_prev.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	if is_phone:
+		var vw := PanelContainer.new()
+		vw.add_theme_stylebox_override("panel", _sbox(Color("07090d"), 10, 4, 4, C_BG3, 2))
+		vw.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		p.add_child(vw)
+		chat_scroll = ScrollContainer.new()
+		chat_scroll.resized.connect(_chat_zoom_apply)
+		vw.add_child(chat_scroll)
+		chat_scroll.add_child(shot_prev)
+		sel_box = SelBox.new()
+		sel_box.set_anchors_preset(Control.PRESET_FULL_RECT)
+		sel_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		shot_prev.add_child(sel_box)
+		shot_prev.mouse_filter = Control.MOUSE_FILTER_STOP
+		shot_prev.gui_input.connect(_sel_input)
+		var tb := HBoxContainer.new()
+		tb.add_theme_constant_override("separation", 8)
+		p.add_child(tb)
+		var zo := Button.new()
+		zo.text = "−"
+		zo.custom_minimum_size = Vector2(44, 40)
+		zo.pressed.connect(func(): _chat_zoom(-1))
+		tb.add_child(zo)
+		zoom_lbl = Label.new()
+		zoom_lbl.text = "×1"
+		zoom_lbl.custom_minimum_size = Vector2(44, 0)
+		zoom_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		tb.add_child(zoom_lbl)
+		var zi := Button.new()
+		zi.text = "+"
+		zi.custom_minimum_size = Vector2(44, 40)
+		zi.pressed.connect(func(): _chat_zoom(1))
+		tb.add_child(zi)
+		var sp := Control.new()
+		sp.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		tb.add_child(sp)
+		chat_status = Label.new()
+		chat_status.add_theme_font_size_override("font_size", 13)
+		chat_status.modulate = Color(1, 1, 1, 0.7)
+		tb.add_child(chat_status)
+		var gear := Button.new()
+		gear.text = "⚙"
+		gear.custom_minimum_size = Vector2(44, 40)
+		tb.add_child(gear)
 		var row := HBoxContainer.new()
 		row.add_theme_constant_override("separation", 8)
 		p.add_child(row)
@@ -609,23 +670,12 @@ func _build_screen_tab(parent: Node) -> void:
 		cb.custom_minimum_size = Vector2(0, 44)
 		cb.pressed.connect(func(): _chat_submit(chat_edit))
 		row.add_child(cb)
-		chat_status = Label.new()
-		chat_status.add_theme_font_size_override("font_size", 13)
-		chat_status.modulate = Color(1, 1, 1, 0.7)
-		p.add_child(chat_status)
-		p.add_child(shot_prev)
-		var tg := Button.new()
-		tg.text = "Réglages de la capture ▾"
-		tg.flat = true
-		p.add_child(tg)
 		var box := VBoxContainer.new()
 		box.visible = false
 		box.add_theme_constant_override("separation", 4)
 		p.add_child(box)
-		tg.pressed.connect(func():
-			box.visible = not box.visible
-			tg.text = "Réglages de la capture " + ("▴" if box.visible else "▾"))
-		for d in [["X", 0, 90, 0], ["Y", 0, 90, 0], ["Larg.", 10, 100, 45], ["Haut.", 5, 100, 30], ["Durée", 2, 20, 6]]:
+		gear.pressed.connect(func(): box.visible = not box.visible)
+		for d in [["X", 0, 90, 0], ["Y", 0, 90, 0], ["Larg.", 10, 100, 35], ["Haut.", 5, 100, 30], ["Durée", 2, 20, 6]]:
 			var hr := HBoxContainer.new()
 			box.add_child(hr)
 			var l := Label.new()
@@ -642,9 +692,13 @@ func _build_screen_tab(parent: Node) -> void:
 			hr.add_child(sl)
 			shot_sl.append(sl)
 		chat_enter = CheckButton.new()
-		chat_enter.text = "« ! » avant d'écrire"
+		chat_enter.text = "« ! » puis Entrée autour de la capture"
 		chat_enter.button_pressed = true
 		box.add_child(chat_enter)
+		sel_tg = Button.new()
+		sel_tg.text = "Choisir la zone sur l'écran du PC"
+		sel_tg.pressed.connect(_sel_start)
+		box.add_child(sel_tg)
 	else:
 		shot_info = Label.new()
 		p.add_child(shot_info)
@@ -658,7 +712,71 @@ func _build_screen_tab(parent: Node) -> void:
 			c.set_value("pc", "chat", on)
 			c.save("user://pref.cfg"))
 		p.add_child(chat_allow)
+		shot_prev.custom_minimum_size = Vector2(0, 150)
 		p.add_child(shot_prev)
+
+
+const ZOOMS := [1.0, 1.5, 2.0, 3.0, 4.0]
+
+
+func _chat_zoom(dir: int) -> void:
+	var i := ZOOMS.find(chat_zoom)
+	chat_zoom = ZOOMS[clampi(i + dir, 0, ZOOMS.size() - 1)]
+	zoom_lbl.text = "×%s" % str(chat_zoom)
+	_chat_zoom_apply()
+
+
+## Adapte l'image à la largeur de la visionneuse (× zoom) : texte net, défilement au doigt.
+func _chat_zoom_apply() -> void:
+	if chat_scroll == null or shot_prev.texture == null:
+		return
+	var tex := shot_prev.texture
+	var w := maxf(chat_scroll.size.x - 8.0, 50.0) * chat_zoom
+	shot_prev.custom_minimum_size = Vector2(w, w * tex.get_height() / maxf(tex.get_width(), 1))
+
+
+## Choix de la zone : le PC envoie tout l'écran, on dessine un rectangle dessus.
+func _sel_start() -> void:
+	chat_zoom = 1.0
+	zoom_lbl.text = "×1"
+	selecting = true
+	sel_box.active = false
+	sel_box.queue_redraw()
+	chat_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	chat_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	chat_status.text = "Dessine la zone"
+	_request_shot(true, false, true)
+
+
+func _sel_input(ev: InputEvent) -> void:
+	if not selecting:
+		return
+	var sz := shot_prev.size
+	if sz.x < 1.0 or sz.y < 1.0:
+		return
+	if ev is InputEventMouseButton and ev.button_index == MOUSE_BUTTON_LEFT:
+		if ev.pressed:
+			sel_a = (ev.position / sz).clamp(Vector2.ZERO, Vector2.ONE)
+			sel_box.r = Rect2(sel_a, Vector2.ZERO)
+			sel_box.active = true
+		elif sel_box.active:
+			var r := sel_box.r
+			sel_box.active = false
+			sel_box.queue_redraw()
+			if r.size.x > 0.03 and r.size.y > 0.03:
+				shot_sl[0].value = r.position.x * 100.0
+				shot_sl[1].value = r.position.y * 100.0
+				shot_sl[2].value = r.size.x * 100.0
+				shot_sl[3].value = r.size.y * 100.0
+				selecting = false
+				chat_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+				chat_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+				chat_status.text = "Zone enregistrée"
+				_request_shot(true, false)
+	elif ev is InputEventMouseMotion and sel_box.active:
+		var b: Vector2 = (ev.position / sz).clamp(Vector2.ZERO, Vector2.ONE)
+		sel_box.r = Rect2(sel_a, b - sel_a).abs()
+		sel_box.queue_redraw()
 
 
 func _build_drive_tab(parent: Node) -> void:
@@ -1043,6 +1161,7 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 				var tx := ImageTexture.create_from_image(im)
 				shot_view.texture = tx
 				shot_prev.texture = tx
+				_chat_zoom_apply()
 				shot_until = Time.get_ticks_msec() + int(shot_sl[4].value) * 1000
 		return
 	if t == T_SHOTREQ and not is_phone and pl.size() >= 4:
@@ -1786,7 +1905,7 @@ func _drive_tick(delta: float) -> void:
 	for z in pad_zones:
 		z.modulate = Color(1.6, 1.6, 1.6) if pr.has(z.name) else Color.WHITE
 	var sel := pr.has("Select")
-	if sel and (not sel_prev or Time.get_ticks_msec() - shot_req_t > 1200):
+	if sel and not sel_prev:
 		_request_shot(false)
 	sel_prev = sel
 	shot_frame.visible = Time.get_ticks_msec() < shot_until
@@ -1849,12 +1968,15 @@ func _chat_submit(le: LineEdit) -> void:
 		_chat_panel(false)
 
 
-func _request_shot(show_prev: bool) -> void:
+func _request_shot(_show_prev: bool, keys := true, full := false) -> void:
 	shot_req_t = Time.get_ticks_msec()
 	var b := PackedByteArray()
-	for sl in shot_sl:
-		b.append(int(sl.value))
-	b.resize(4)
+	if full:
+		b.append_array(PackedByteArray([0, 0, 100, 100, 0]))
+	else:
+		for i in 4:
+			b.append(int(shot_sl[i].value))
+		b.append(1 if (keys and chat_enter.button_pressed) else 0)
 	_send(T_SHOTREQ, b)
 
 
@@ -1982,8 +2104,9 @@ for line in sys.stdin:
         time.sleep(0.25)
     for ch in m.get('text', ''):
         type_char(ch)
-    time.sleep(0.05)
-    tap(RET, [])
+    if m.get('enter', True):
+        time.sleep(0.05)
+        tap(RET, [])
 """
 
 
@@ -2047,18 +2170,26 @@ func _grab(fx: float, fy: float, fw: float, fh: float) -> Image:
 
 func _pc_shot(pl: PackedByteArray) -> void:
 	var now := Time.get_ticks_msec()
-	if now - shot_last_t < 300:
+	if now - shot_last_t < 700:
 		return
 	shot_last_t = now
+	var keys := pl.size() >= 5 and (pl[4] & 1) != 0 and chat_allow.button_pressed and _kb_start()
+	if keys:  # ouvre le chat du jeu avec « ! », laisse le temps de s'afficher
+		kb_io.store_line(JSON.stringify({"open": "!", "text": "", "enter": false}))
+		kb_io.flush()
+		await get_tree().create_timer(0.5).timeout
 	var im := _grab(pl[0] / 100.0, pl[1] / 100.0, pl[2] / 100.0, pl[3] / 100.0)
+	if keys and kb_io != null:  # referme le chat avec Entrée
+		kb_io.store_line(JSON.stringify({"open": "", "text": "", "enter": true}))
+		kb_io.flush()
 	if im == null:
 		if shot_info != null:
 			shot_info.text = "Capture impossible."
 		return
-	if im.get_width() > 800:
-		im.resize(800, int(im.get_height() * 800.0 / im.get_width()), Image.INTERPOLATE_BILINEAR)
+	if im.get_width() > 1400:
+		im.resize(1400, int(im.get_height() * 1400.0 / im.get_width()), Image.INTERPOLATE_LANCZOS)
 	im.convert(Image.FORMAT_RGB8)
-	var jpg := im.save_jpg_to_buffer(0.7)
+	var jpg := im.save_jpg_to_buffer(0.9)
 	shot_prev.texture = ImageTexture.create_from_image(im)
 	if shot_info != null:
 		shot_info.text = "Dernière capture : %dx%d, %d Ko" % [im.get_width(), im.get_height(), jpg.size() / 1024]
