@@ -6,14 +6,14 @@ extends Control
 const PORT := 5005
 const RATE := 48000
 const PKG := "fr.goodview.usbspeaker"
-const VERSION := 7  # versionCode de l'APK
-const APP_VERSION := "1.5.0"
+const VERSION := 8  # versionCode de l'APK
+const APP_VERSION := "1.6.0"
 const REPO := "goodview-soft/usb-speaker"
 const T_AUDIO := 1  # PC -> téléphone : PCM s16 stéréo 48 kHz
 const T_MIC := 2  # téléphone -> PC : PCM s16 mono
 const T_HELLO := 3  # téléphone -> PC : u32 fréquence du micro (= connexion acceptée)
 const T_CTRL := 5  # téléphone -> PC : [son du PC voulu, micro envoyé]
-const T_DRIVE := 6  # téléphone -> PC : s16 volant, u8 gaz, u8 frein, u8 boutons (A B X Y)
+const T_DRIVE := 6  # téléphone -> PC : 4×s16 sticks (LX LY RX RY), u8 LT, u8 RT, u16 boutons
 const T_NAME := 4  # PC -> téléphone : nom du PC (utf8)
 const SINK := "usbspk_out"
 const MIC_SINK := "usbspk_mic_sink"
@@ -67,23 +67,28 @@ var name_sent := false
 var tabs: TabContainer
 var wheel: Wheel
 var drive_info: Label
-var gas_z: Panel
-var brake_z: Panel
-var btn_z: Array = []
-var range_slider: HSlider
-var invert_check: CheckButton
-var calib_btn: Button
-var touches := {}
+var pad_ui: Control
+var pad_open := false
+var pad_zones: Array = []
+var lstick: Stick
+var rstick: Stick
+var gyro_btn: Button
+var inv_btn: Button
+var pad_hint: Label
+var gyro_on := false
+var gyro_range := 45.0
+var owned := {}
 var ang_off := 0.0
 var cal_t := 0.0
 var steer_s := 0.0
+var touches := {}
 var drive_was := false
 var pad_pid := -1
 var pad_io: FileAccess
 var pad_err: FileAccess
 var pad_last := ""
 var drive_t := 0
-var drive_v := [0, 0, 0, 0]
+var drive_v := [0, 0, 0, 0, 0, 0, 0]
 var drive_check: CheckButton
 var sound_check: CheckButton
 var phone_sound := true
@@ -122,6 +127,28 @@ func _exit_tree() -> void:
 
 
 # ------------------------------------------------------------------ UI
+
+class Stick extends Control:
+	var idx := -1
+	var v := Vector2.ZERO
+
+	func _draw() -> void:
+		var c := size / 2.0
+		var r := minf(size.x, size.y) * 0.5
+		draw_circle(c, r, Color(1, 1, 1, 0.10))
+		draw_arc(c, r, 0.0, TAU, 48, Color(1, 1, 1, 0.35), 3.0)
+		draw_circle(c + v * r * 0.6, r * 0.36, Color(1, 1, 1, 0.55))
+
+	func set_touch(pos: Vector2) -> void:
+		var c := get_global_rect().get_center()
+		v = ((pos - c) / (minf(size.x, size.y) * 0.4)).limit_length(1.0)
+		queue_redraw()
+
+	func release() -> void:
+		idx = -1
+		v = Vector2.ZERO
+		queue_redraw()
+
 
 class Wheel extends Control:
 	var steer := 0.0:
@@ -220,79 +247,151 @@ func _build_ui() -> void:
 	_build_drive_tab()
 
 
-func _zone(id: String, txt: String, col: Color, h: int) -> Panel:
+## Zone tactile de la manette, placée par fractions de l'écran (centre cx, cy ; taille w, h).
+func _pz(id: String, txt: String, col: Color, cx: float, cy: float, w: float, h: float, fs := 24) -> Panel:
 	var p := Panel.new()
 	p.name = id
-	p.custom_minimum_size = Vector2(0, h)
-	p.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	p.anchor_left = cx
+	p.anchor_right = cx
+	p.anchor_top = cy
+	p.anchor_bottom = cy
+	p.offset_left = -w / 2.0
+	p.offset_right = w / 2.0
+	p.offset_top = -h / 2.0
+	p.offset_bottom = h / 2.0
 	p.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = col
-	sb.set_corner_radius_all(16)
+	sb.set_corner_radius_all(int(minf(w, h) * 0.3))
 	p.add_theme_stylebox_override("panel", sb)
 	var l := Label.new()
 	l.text = txt
 	l.set_anchors_preset(Control.PRESET_FULL_RECT)
 	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	l.add_theme_font_size_override("font_size", 26)
+	l.add_theme_font_size_override("font_size", fs)
 	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	p.add_child(l)
+	pad_ui.add_child(p)
+	pad_zones.append(p)
 	return p
+
+
+func _pbtn(txt: String, cx: float, w: float) -> Button:
+	var b := Button.new()
+	b.text = txt
+	b.anchor_left = cx
+	b.anchor_right = cx
+	b.offset_left = -w / 2.0
+	b.offset_right = w / 2.0
+	b.offset_top = 8.0
+	b.offset_bottom = 56.0
+	pad_ui.add_child(b)
+	return b
 
 
 func _build_drive_tab() -> void:
 	var p := VBoxContainer.new()
-	p.name = "Conduite"
-	p.add_theme_constant_override("separation", 12)
+	p.name = "Manette"
+	p.add_theme_constant_override("separation", 14)
 	tabs.add_child(p)
-	wheel = Wheel.new()
-	wheel.custom_minimum_size = Vector2(0, 170)
-	wheel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	p.add_child(wheel)
 	drive_info = Label.new()
 	drive_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	drive_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	p.add_child(drive_info)
 	if is_phone:
-		drive_info.text = "Tiens le téléphone comme un volant."
-		var row := HBoxContainer.new()
-		row.add_theme_constant_override("separation", 12)
-		brake_z = _zone("brake", "FREIN", Color("c0392b"), 150)
-		gas_z = _zone("gas", "GAZ", Color("27ae60"), 150)
-		row.add_child(brake_z)
-		row.add_child(gas_z)
-		p.add_child(row)
-		var row2 := HBoxContainer.new()
-		row2.add_theme_constant_override("separation", 10)
-		for k in ["A", "B", "X", "Y"]:
-			var z := _zone(k, k, Color("3b4252"), 64)
-			btn_z.append(z)
-			row2.add_child(z)
-		p.add_child(row2)
-		calib_btn = Button.new()
-		calib_btn.text = "Recentrer le volant (3 s)"
-		calib_btn.custom_minimum_size = Vector2(0, 52)
-		calib_btn.pressed.connect(func(): cal_t = 3.0)
-		p.add_child(calib_btn)
-		var l := Label.new()
-		l.text = "Angle pour braquer à fond"
-		p.add_child(l)
-		range_slider = HSlider.new()
-		range_slider.min_value = 20.0
-		range_slider.max_value = 90.0
-		range_slider.value = 45.0
-		range_slider.custom_minimum_size = Vector2(0, 40)
-		p.add_child(range_slider)
-		invert_check = CheckButton.new()
-		invert_check.text = "Inverser le sens"
-		p.add_child(invert_check)
+		drive_info.text = "Le téléphone devient une manette (2 joysticks, gâchettes, boutons, croix), avec un volant par inclinaison en option."
+		var ob := Button.new()
+		ob.text = "Ouvrir la manette"
+		ob.custom_minimum_size = Vector2(0, 64)
+		ob.pressed.connect(func(): _open_pad(true))
+		p.add_child(ob)
+		tabs.tab_changed.connect(func(i): if i == 1: _open_pad(true))
+		_build_pad_ui()
 	else:
-		drive_info.text = "Sur le téléphone, ouvre l'onglet Conduite. Dans le jeu, choisis la manette « USB Speaker Volant »."
+		wheel = Wheel.new()
+		wheel.custom_minimum_size = Vector2(0, 150)
+		p.add_child(wheel)
+		drive_info.text = "Sur le téléphone, ouvre l'onglet Manette. Dans le jeu, choisis la manette « USB Speaker Volant »."
 		drive_check = CheckButton.new()
 		drive_check.text = "Manette virtuelle active"
 		drive_check.button_pressed = true
 		p.add_child(drive_check)
+
+
+func _build_pad_ui() -> void:
+	pad_ui = Control.new()
+	pad_ui.set_anchors_preset(Control.PRESET_FULL_RECT)
+	pad_ui.mouse_filter = Control.MOUSE_FILTER_STOP
+	pad_ui.visible = false
+	var bg := ColorRect.new()
+	bg.color = Color("0f1218")
+	bg.set_anchors_preset(Control.PRESET_FULL_RECT)
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	pad_ui.add_child(bg)
+	add_child(pad_ui)
+	var g := Color("3b4252")
+	_pz("LT", "LT", g, 0.12, 0.26, 150, 64)
+	_pz("LB", "LB", g, 0.12, 0.40, 150, 54)
+	_pz("RT", "RT", g, 0.88, 0.26, 150, 64)
+	_pz("RB", "RB", g, 0.88, 0.40, 150, 54)
+	_pz("Select", "Sel", g, 0.43, 0.42, 80, 44, 18)
+	_pz("Start", "Start", g, 0.57, 0.42, 80, 44, 18)
+	_pz("DUp", "▲", g, 0.37, 0.60, 62, 62)
+	_pz("DDown", "▼", g, 0.37, 0.88, 62, 62)
+	_pz("DLeft", "◀", g, 0.30, 0.74, 62, 62)
+	_pz("DRight", "▶", g, 0.44, 0.74, 62, 62)
+	_pz("Y", "Y", Color("d4a017"), 0.87, 0.52, 74, 74, 28)
+	_pz("A", "A", Color("27ae60"), 0.87, 0.86, 74, 74, 28)
+	_pz("X", "X", Color("2e86de"), 0.80, 0.69, 74, 74, 28)
+	_pz("B", "B", Color("c0392b"), 0.94, 0.69, 74, 74, 28)
+	lstick = Stick.new()
+	rstick = Stick.new()
+	for pair in [[lstick, 0.16], [rstick, 0.62]]:
+		var st: Stick = pair[0]
+		st.anchor_left = pair[1]
+		st.anchor_right = pair[1]
+		st.anchor_top = 0.72
+		st.anchor_bottom = 0.72
+		st.offset_left = -95.0
+		st.offset_right = 95.0
+		st.offset_top = -95.0
+		st.offset_bottom = 95.0
+		st.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		pad_ui.add_child(st)
+	var back := _pbtn("← Retour", 0.10, 130)
+	back.pressed.connect(func(): _open_pad(false))
+	gyro_btn = _pbtn("Gyroscope : OFF", 0.32, 200)
+	gyro_btn.toggle_mode = true
+	gyro_btn.toggled.connect(func(on):
+		gyro_on = on
+		gyro_btn.text = "Gyroscope : " + ("ON" if on else "OFF")
+		if on:
+			cal_t = 2.0)
+	var rc := _pbtn("Recentrer", 0.55, 140)
+	rc.pressed.connect(func(): cal_t = 2.0)
+	inv_btn = _pbtn("Inverser", 0.72, 120)
+	inv_btn.toggle_mode = true
+	pad_hint = Label.new()
+	pad_hint.anchor_left = 0.3
+	pad_hint.anchor_right = 0.7
+	pad_hint.anchor_top = 0.15
+	pad_hint.anchor_bottom = 0.15
+	pad_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	pad_hint.modulate = Color(1, 1, 1, 0.7)
+	pad_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	pad_ui.add_child(pad_hint)
+
+
+func _open_pad(on: bool) -> void:
+	pad_ui.visible = on
+	pad_open = on
+	touches.clear()
+	owned.clear()
+	lstick.release()
+	rstick.release()
+	DisplayServer.screen_set_orientation(
+		DisplayServer.SCREEN_SENSOR_LANDSCAPE if on else DisplayServer.SCREEN_PORTRAIT)
 
 
 func _set_status(t: String, s := "") -> void:
@@ -344,8 +443,8 @@ func _on_frame(t: int, pl: PackedByteArray) -> void:
 		for i in range(0, pl.size() - 1, 16):
 			p = maxi(p, absi(pl.decode_s16(i)))
 		peak = maxf(peak, p / 32768.0)
-	elif not is_phone and t == T_DRIVE and pl.size() >= 5:
-		drive_v = [pl.decode_s16(0), pl[2], pl[3], pl[4]]
+	elif not is_phone and t == T_DRIVE and pl.size() >= 12:
+		drive_v = [pl.decode_s16(0), pl.decode_s16(2), pl.decode_s16(4), pl.decode_s16(6), pl[8], pl[9], pl.decode_u16(10)]
 		drive_t = Time.get_ticks_msec()
 		wheel.steer = drive_v[0] / 32767.0
 		if drive_check.button_pressed:
@@ -914,59 +1013,82 @@ func _on_zip(result: int, code: int, _h: PackedStringArray, _b: PackedByteArray)
 	get_tree().quit()
 
 
-# ------------------------------------------------------------------ Conduite
+# ------------------------------------------------------------------ Manette
 
 func _input(ev: InputEvent) -> void:
-	if not is_phone:
+	if not is_phone or not pad_open:
 		return
 	if ev is InputEventScreenTouch:
 		if ev.pressed:
 			touches[ev.index] = ev.position
+			for st in [lstick, rstick]:
+				if st.idx == -1 and st.get_global_rect().has_point(ev.position):
+					st.idx = ev.index
+					owned[ev.index] = true
+					st.set_touch(ev.position)
+					break
 		else:
 			touches.erase(ev.index)
+			owned.erase(ev.index)
+			for st in [lstick, rstick]:
+				if st.idx == ev.index:
+					st.release()
 	elif ev is InputEventScreenDrag:
 		touches[ev.index] = ev.position
+		for st in [lstick, rstick]:
+			if st.idx == ev.index:
+				st.set_touch(ev.position)
 
 
-## Téléphone : angle du volant (gravité) + boutons tactiles -> trame T_DRIVE.
+## Téléphone : sticks, gâchettes, boutons (+ volant gyroscope optionnel) -> trame T_DRIVE.
 func _drive_tick(delta: float) -> void:
-	if tabs.current_tab != 1:
+	if not pad_open:
 		if drive_was:
 			drive_was = false
-			_send(T_DRIVE, PackedByteArray([0, 0, 0, 0, 0]))
+			_send(T_DRIVE, PackedByteArray([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
 		return
 	drive_was = true
-	var g := Input.get_gravity()
-	if g.length() < 0.1:
-		g = Input.get_accelerometer()
-	var ang := rad_to_deg(atan2(g.x, g.y))
-	if cal_t > 0.0:
-		cal_t -= delta
-		calib_btn.text = "Recentrage dans %d s…" % ceili(maxf(cal_t, 0.0))
-		if cal_t <= 0.0:
-			ang_off = ang
-			calib_btn.text = "Recentrer le volant (3 s)"
-	var d := wrapf(ang - ang_off, -180.0, 180.0)
-	var tgt := clampf(d / range_slider.value, -1.0, 1.0) * (-1.0 if invert_check.button_pressed else 1.0)
-	steer_s = lerpf(steer_s, tgt, clampf(delta * 25.0, 0.0, 1.0))
-	wheel.steer = steer_s
 	var pr := {}
-	for pos in touches.values():
-		for z in [gas_z, brake_z] + btn_z:
-			if z.get_global_rect().has_point(pos):
+	for k in touches:
+		if owned.has(k):
+			continue
+		for z in pad_zones:
+			if z.get_global_rect().has_point(touches[k]):
 				pr[z.name] = true
-	for z in [gas_z, brake_z] + btn_z:
-		z.modulate = Color(1.5, 1.5, 1.5) if pr.has(z.name) else Color.WHITE
+	for z in pad_zones:
+		z.modulate = Color(1.6, 1.6, 1.6) if pr.has(z.name) else Color.WHITE
+	var lx := lstick.v.x
+	if gyro_on or cal_t > 0.0:
+		var g := Input.get_gravity()
+		if g.length() < 0.1:
+			g = Input.get_accelerometer()
+		var ang := rad_to_deg(atan2(g.x, g.y))
+		if cal_t > 0.0:
+			cal_t -= delta
+			pad_hint.text = "Tiens le volant droit… %d" % ceili(maxf(cal_t, 0.0))
+			if cal_t <= 0.0:
+				ang_off = ang
+				pad_hint.text = ""
+		elif gyro_on:
+			var d := wrapf(ang - ang_off, -180.0, 180.0)
+			var tgt := clampf(d / gyro_range, -1.0, 1.0) * (-1.0 if inv_btn.button_pressed else 1.0)
+			steer_s = lerpf(steer_s, tgt, clampf(delta * 25.0, 0.0, 1.0))
+			lx = steer_s
 	var mask := 0
-	for i in 4:
-		if pr.has(["A", "B", "X", "Y"][i]):
-			mask |= 1 << i
+	var bits := {"A": 0, "B": 1, "X": 2, "Y": 3, "LB": 4, "RB": 5, "Select": 6, "Start": 7,
+			"DUp": 10, "DDown": 11, "DLeft": 12, "DRight": 13}
+	for k in bits:
+		if pr.has(k):
+			mask |= 1 << bits[k]
 	var b := PackedByteArray()
-	b.resize(5)
-	b.encode_s16(0, int(steer_s * 32767.0))
-	b[2] = 255 if pr.has("gas") else 0
-	b[3] = 255 if pr.has("brake") else 0
-	b[4] = mask
+	b.resize(12)
+	b.encode_s16(0, int(lx * 32767.0))
+	b.encode_s16(2, int(lstick.v.y * 32767.0))
+	b.encode_s16(4, int(rstick.v.x * 32767.0))
+	b.encode_s16(6, int(rstick.v.y * 32767.0))
+	b[8] = 255 if pr.has("LT") else 0
+	b[9] = 255 if pr.has("RT") else 0
+	b.encode_u16(10, mask)
 	_send(T_DRIVE, b)
 
 
@@ -977,8 +1099,8 @@ def io(req, arg=0):
 SET_EV, SET_KEY, SET_ABS = 0x40045564, 0x40045565, 0x40045567
 DEV_SETUP, ABS_SETUP, CREATE, DESTROY = 0x405c5503, 0x401c5504, 0x5501, 0x5502
 io(SET_EV, 1); io(SET_EV, 3)
-BTN = [0x130, 0x131, 0x133, 0x134]
-for c in BTN + [0x136, 0x137, 0x13a, 0x13b, 0x13c, 0x13d, 0x13e]:
+BTN = {0: 0x130, 1: 0x131, 2: 0x133, 3: 0x134, 4: 0x136, 5: 0x137, 6: 0x13a, 7: 0x13b}
+for c in list(BTN.values()) + [0x13c, 0x13d, 0x13e]:
     io(SET_KEY, c)
 AX = [(0, -32768, 32767), (1, -32768, 32767), (3, -32768, 32767), (4, -32768, 32767), (2, 0, 255), (5, 0, 255), (16, -1, 1), (17, -1, 1)]
 for c, mn, mx in AX:
@@ -990,21 +1112,26 @@ io(CREATE)
 def ev(t, c, v):
     s = time.time()
     os.write(fd, struct.pack('llHHi', int(s), int((s % 1) * 1e6), t, c, v))
+def cl(v, lo, hi):
+    return max(lo, min(hi, v))
 state = {}
 try:
     for line in sys.stdin:
         try:
-            s, g, b, k = [int(x) for x in line.split()]
+            lx, ly, rx, ry, lt, rt, k = [int(x) for x in line.split()]
         except Exception:
             continue
-        for code, v in ((0, max(-32767, min(32767, s))), (5, g), (2, b)):
+        hx = ((k >> 13) & 1) - ((k >> 12) & 1)
+        hy = ((k >> 11) & 1) - ((k >> 10) & 1)
+        for code, v in ((0, cl(lx, -32767, 32767)), (1, cl(ly, -32767, 32767)), (3, cl(rx, -32767, 32767)),
+                        (4, cl(ry, -32767, 32767)), (2, cl(lt, 0, 255)), (5, cl(rt, 0, 255)), (16, hx), (17, hy)):
             if state.get(code) != v:
                 state[code] = v
                 ev(3, code, v)
-        for i, code in enumerate(BTN):
-            on = (k >> i) & 1
-            if state.get(code) != on:
-                state[code] = on
+        for bit, code in BTN.items():
+            on = (k >> bit) & 1
+            if state.get(1000 + code) != on:
+                state[1000 + code] = on
                 ev(1, code, on)
         ev(0, 0, 0)
 finally:
@@ -1046,9 +1173,9 @@ func _pad_tick() -> void:
 		return
 	var v: Array = drive_v
 	if Time.get_ticks_msec() - drive_t > 1000:
-		v = [0, 0, 0, 0]
+		v = [0, 0, 0, 0, 0, 0, 0]
 		wheel.steer = 0.0
-	var line := "%d %d %d %d" % v
+	var line := "%d %d %d %d %d %d %d" % v
 	if line != pad_last:
 		pad_last = line
 		pad_io.store_line(line)
