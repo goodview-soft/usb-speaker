@@ -13,8 +13,8 @@ driver/enable_input=true
 
 [display]
 
-window/size/viewport_width=420
-window/size/viewport_height=520
+window/size/viewport_width=400
+window/size/viewport_height=800
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 window/handheld/orientation=1
